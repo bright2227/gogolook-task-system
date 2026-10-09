@@ -7,23 +7,24 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/bright2227/vsx-task-system/internal/app"
-	"github.com/bright2227/vsx-task-system/internal/task"
 )
 
 type API struct {
-	Tasks    app.Tasks
+	Tasks    app.TaskUseCases
 	Ready    func(context.Context) error
 	requests atomic.Int64
 	failures atomic.Int64
 }
+
 type response struct {
-	ID        task.ID         `json:"id"`
+	ID        string          `json:"id"`
 	Payload   json.RawMessage `json:"payload"`
-	Status    task.Status     `json:"status"`
+	Status    string          `json:"status"`
 	Result    *string         `json:"result"`
 	Error     *string         `json:"error"`
 	CreatedAt time.Time       `json:"created_at"`
@@ -36,18 +37,20 @@ func write(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func taskResponse(s task.Snapshot) response {
-	return response{s.ID, s.Payload.JSON(), s.Status, s.Result, s.Error, s.CreatedAt, s.UpdatedAt, s.Attempts}
+func taskResponse(s app.TaskResponse) response {
+	return response{s.ID, json.RawMessage(s.Payload), s.Status, s.Result, s.Error, s.CreatedAt, s.UpdatedAt, s.Attempts}
 }
 func (a *API) problem(w http.ResponseWriter, err error) {
 	code, message := http.StatusServiceUnavailable, "storage temporarily unavailable"
 	switch {
 	case errors.Is(err, app.ErrNotFound):
 		code, message = http.StatusNotFound, err.Error()
-	case errors.Is(err, task.ErrCompleted), errors.Is(err, app.ErrConflict):
-		code, message = http.StatusConflict, err.Error()
-	case errors.Is(err, task.ErrPayload):
+	case errors.Is(err, app.ErrInvalidID):
+		code, message = http.StatusBadRequest, err.Error()
+	case errors.Is(err, app.ErrInvalidPayload):
 		code, message = http.StatusUnprocessableEntity, err.Error()
+	case errors.Is(err, app.ErrCompleted), errors.Is(err, app.ErrConflict):
+		code, message = http.StatusConflict, err.Error()
 	default:
 		a.failures.Add(1)
 		slog.Error("request failed", "error", err)
@@ -99,26 +102,16 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 		write(w, 400, map[string]string{"error": "expected one JSON object"})
 		return
 	}
-	p, err := task.NewPayload(in.Payload)
+	s, err := a.Tasks.Submit(r.Context(), app.SubmitTaskRequest{Payload: in.Payload})
 	if err != nil {
 		a.problem(w, err)
 		return
 	}
-	s, err := a.Tasks.Submit(r.Context(), p)
-	if err != nil {
-		a.problem(w, err)
-		return
-	}
-	w.Header().Set("Location", "/tasks/"+string(s.ID))
+	w.Header().Set("Location", "/tasks/"+s.ID)
 	write(w, http.StatusAccepted, taskResponse(s))
 }
 func (a *API) get(w http.ResponseWriter, r *http.Request) {
-	id, err := task.ParseID(r.PathValue("id"))
-	if err != nil {
-		write(w, 400, map[string]string{"error": err.Error()})
-		return
-	}
-	s, err := a.Tasks.Get(r.Context(), id)
+	s, err := a.Tasks.Get(r.Context(), app.TaskRequest{ID: r.PathValue("id")})
 	if err != nil {
 		a.problem(w, err)
 		return
@@ -128,16 +121,11 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 func (a *API) cancel(w http.ResponseWriter, r *http.Request) {
 	action := r.PathValue("action")
 	const suffix = ":cancel"
-	if len(action) < len(suffix) || action[len(action)-len(suffix):] != suffix {
+	if len(action) < len(suffix) || !strings.HasSuffix(action, suffix) {
 		http.NotFound(w, r)
 		return
 	}
-	id, err := task.ParseID(action[:len(action)-len(suffix)])
-	if err != nil {
-		write(w, 400, map[string]string{"error": err.Error()})
-		return
-	}
-	s, err := a.Tasks.Cancel(r.Context(), id)
+	s, err := a.Tasks.Cancel(r.Context(), app.TaskRequest{ID: strings.TrimSuffix(action, suffix)})
 	if err != nil {
 		a.problem(w, err)
 		return

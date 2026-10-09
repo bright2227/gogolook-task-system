@@ -333,17 +333,15 @@ func (pc *publishChannel) invalidate() {
 	pc.returns = nil
 }
 
-type Handler func(context.Context, task.ID) error
-
 // Consume reconnects until ctx is canceled. Each channel uses bounded prefetch
 // and a fixed worker count. A failed retry/DLQ publish leaves the delivery
 // unacknowledged so closing the channel returns it to the durable source queue.
-func (c *Client) Consume(ctx context.Context, workers int, handler Handler) error {
+func (c *Client) Consume(ctx context.Context, workers int, processor app.TaskProcessor) error {
 	if workers < 1 {
 		return errors.New("worker count must be positive")
 	}
 	for ctx.Err() == nil {
-		err := c.consumeSession(ctx, workers, handler)
+		err := c.consumeSession(ctx, workers, processor)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -357,7 +355,7 @@ func (c *Client) Consume(ctx context.Context, workers int, handler Handler) erro
 	return ctx.Err()
 }
 
-func (c *Client) consumeSession(ctx context.Context, workers int, handler Handler) error {
+func (c *Client) consumeSession(ctx context.Context, workers int, processor app.TaskProcessor) error {
 	conn, err := c.connection()
 	if err != nil {
 		return err
@@ -387,7 +385,7 @@ func (c *Client) consumeSession(ctx context.Context, workers int, handler Handle
 				if ctx.Err() != nil {
 					continue
 				}
-				c.handle(ctx, ch, d, handler)
+				c.handle(ctx, ch, d, processor)
 			}
 		}()
 	}
@@ -403,7 +401,7 @@ func (c *Client) consumeSession(ctx context.Context, workers int, handler Handle
 	}
 }
 
-func (c *Client) handle(ctx context.Context, ch *amqp.Channel, d amqp.Delivery, handler Handler) {
+func (c *Client) handle(ctx context.Context, ch *amqp.Channel, d amqp.Delivery, processor app.TaskProcessor) {
 	m, err := decode(d.Body)
 	if err != nil {
 		if publishErr := c.DeadLetter(ctx, d.Body); publishErr != nil {
@@ -417,7 +415,7 @@ func (c *Client) handle(ctx context.Context, ch *amqp.Channel, d amqp.Delivery, 
 		slog.Warn("task delivery dead-lettered", "reason", "malformed", "error", err)
 		return
 	}
-	err = handler(ctx, m.TaskID)
+	err = processor.Process(ctx, app.ProcessTaskRequest{ID: string(m.TaskID)})
 	if err == nil {
 		if ackErr := d.Ack(false); ackErr != nil {
 			slog.Error("processed task delivery ack failed", "task_id", m.TaskID, "error", ackErr)

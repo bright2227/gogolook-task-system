@@ -1,4 +1,4 @@
-// Package task defines the task-processing bounded context. It has no adapters.
+// Package task contains the task entity and lifecycle rules, independent of infrastructure.
 package task
 
 import (

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bright2227/vsx-task-system/internal/adapter/postgres"
+	adapterprocessor "github.com/bright2227/vsx-task-system/internal/adapter/processor"
 	"github.com/bright2227/vsx-task-system/internal/adapter/rabbitmq"
 	"github.com/bright2227/vsx-task-system/internal/app"
 	runtimecfg "github.com/bright2227/vsx-task-system/internal/runtime"
@@ -34,9 +35,9 @@ func main() {
 	defer store.Close()
 	broker := rabbitmq.New(cfg.Rabbit)
 	defer broker.Close()
-	consumer := app.Consumer{Store: store, Clock: time.Now, Processor: runtimecfg.SimulatedProcessor{}, Lease: cfg.Lease, Timeout: cfg.ProcessTimeout}
+	consumer := app.Consumer{Store: store, Clock: time.Now, Processor: adapterprocessor.SimulatedProcessor{}, Lease: cfg.Lease, Timeout: cfg.ProcessTimeout}
 	slog.Info("worker started", "workers", cfg.Workers)
-	err = broker.Consume(ctx, cfg.Workers, consumer.Process)
+	err = broker.Consume(ctx, cfg.Workers, consumer)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("worker stopped", "error", err)
 		os.Exit(1)

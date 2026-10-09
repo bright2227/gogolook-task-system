@@ -20,9 +20,9 @@ import (
 
 	"github.com/bright2227/vsx-task-system/internal/adapter/httpapi"
 	"github.com/bright2227/vsx-task-system/internal/adapter/postgres"
+	processorapp "github.com/bright2227/vsx-task-system/internal/adapter/processor"
 	"github.com/bright2227/vsx-task-system/internal/adapter/rabbitmq"
 	"github.com/bright2227/vsx-task-system/internal/app"
-	runtimeapp "github.com/bright2227/vsx-task-system/internal/runtime"
 	"github.com/bright2227/vsx-task-system/internal/task"
 	_ "github.com/lib/pq"
 	"github.com/rabbitmq/amqp091-go"
@@ -89,7 +89,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	client := rabbitmq.New(rabbitmq.Config{URL: fmt.Sprintf("amqp://task:task@%s:%s/", host, port.Port()), Queue: "integration.tasks", RetryQueue: "integration.retry", DeadQueue: "integration.dead", RetryDelay: 100 * time.Millisecond})
 	t.Cleanup(func() { _ = client.Close() })
 	payload, _ := task.NewPayload([]byte(`{"job":"integration"}`))
-	created, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, payload)
+	created, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, app.SubmitTaskRequest{Payload: payload.JSON()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,19 +107,21 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if eventCount != 1 || outboxCount != 1 {
 		t.Fatalf("transactional submit events=%d published outbox=%d", eventCount, outboxCount)
 	}
-	consumer := app.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: runtimeapp.SimulatedProcessor{}}
+	consumer := app.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: processorapp.SimulatedProcessor{}}
 	workStarted := time.Now()
 	workPhase, stopWorkPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopWorkPhase()
-	worker := startConsumer(t, ctx, client, 2, func(c context.Context, id task.ID) error { return consumer.Process(c, id) })
+	worker := startConsumer(t, ctx, client, 2, func(c context.Context, id task.ID) error {
+		return consumer.Process(c, app.ProcessTaskRequest{ID: string(id)})
+	})
 	deadline := time.NewTicker(20 * time.Millisecond)
 	defer deadline.Stop()
 	for {
-		state, getErr := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(workPhase, created.ID)
+		state, getErr := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(workPhase, app.TaskRequest{ID: string(created.ID)})
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if state.Status == task.Completed {
+		if state.Status == string(task.Completed) {
 			if elapsed := time.Since(workStarted); elapsed < 3*time.Second {
 				t.Fatalf("sample work completed too early: %s", elapsed)
 			}
@@ -143,11 +145,11 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	concurrentIDs := make([]task.ID, 2)
 	for i := range concurrentIDs {
 		p, _ := task.NewPayload([]byte(`{"job":"parallel"}`))
-		created, submitErr := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, p)
+		created, submitErr := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, app.SubmitTaskRequest{Payload: p.JSON()})
 		if submitErr != nil {
 			t.Fatal(submitErr)
 		}
-		concurrentIDs[i] = created.ID
+		concurrentIDs[i] = task.ID(created.ID)
 	}
 	count, err = (app.Relay{Outbox: pgStore, Publisher: client, Batch: 16}).Once(ctx)
 	if err != nil || count != 2 {
@@ -157,7 +159,9 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	parallelPhase, stopParallelPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopParallelPhase()
 	parallelConsumer := app.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: barrier}
-	parallel := startConsumer(t, ctx, client, 2, func(c context.Context, id task.ID) error { return parallelConsumer.Process(c, id) })
+	parallel := startConsumer(t, ctx, client, 2, func(c context.Context, id task.ID) error {
+		return parallelConsumer.Process(c, app.ProcessTaskRequest{ID: string(id)})
+	})
 	for i := 0; i < 2; i++ {
 		select {
 		case <-barrier.started:
@@ -172,11 +176,11 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	close(barrier.release)
 	for _, id := range concurrentIDs {
 		for {
-			state, getErr := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(parallelPhase, id)
+			state, getErr := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(parallelPhase, app.TaskRequest{ID: string(id)})
 			if getErr != nil {
 				t.Fatal(getErr)
 			}
-			if state.Status == task.Completed {
+			if state.Status == string(task.Completed) {
 				break
 			}
 			select {
@@ -190,12 +194,12 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 		t.Fatalf("parallel worker stop: %v", err)
 	}
 	// A broker-level duplicate delivery after completion remains a no-op.
-	if err = client.Publish(ctx, app.Message{EventID: task.NewID(), TaskID: created.ID}); err != nil {
+	if err = client.Publish(ctx, app.Message{EventID: task.NewID(), TaskID: task.ID(created.ID)}); err != nil {
 		t.Fatal(err)
 	}
 	duplicateSeen := make(chan struct{}, 1)
 	duplicateWorker := startConsumer(t, ctx, client, 1, func(c context.Context, id task.ID) error {
-		err := consumer.Process(c, id)
+		err := consumer.Process(c, app.ProcessTaskRequest{ID: string(id)})
 		duplicateSeen <- struct{}{}
 		return err
 	})
@@ -209,8 +213,8 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err = duplicateWorker.Stop(); err != nil {
 		t.Fatalf("duplicate consumer stop: %v", err)
 	}
-	state, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, created.ID)
-	if err != nil || state.Status != task.Completed || state.Attempts != 1 || state.Result == nil || *state.Result != "processed" {
+	state, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, app.TaskRequest{ID: string(created.ID)})
+	if err != nil || state.Status != string(task.Completed) || state.Attempts != 1 || state.Result == nil || *state.Result != "processed" {
 		t.Fatalf("worker result=%+v err=%v", state, err)
 	}
 	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1`, created.ID).Scan(&eventCount); err != nil || eventCount != 3 {
@@ -234,7 +238,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	}
 
 	cancelPayload, _ := task.NewPayload([]byte(`{}`))
-	cancelTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, cancelPayload)
+	cancelTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, app.SubmitTaskRequest{Payload: cancelPayload.JSON()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,13 +248,13 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	t.Cleanup(unblock)
 	cancelConsumer := app.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: blockingProcessor{started, release}}
 	procDone := make(chan error, 1)
-	go func() { procDone <- cancelConsumer.Process(ctx, cancelTask.ID) }()
+	go func() { procDone <- cancelConsumer.Process(ctx, app.ProcessTaskRequest{ID: string(cancelTask.ID)}) }()
 	select {
 	case <-started:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	if _, err = (app.Tasks{Store: pgStore, Clock: time.Now}).Cancel(ctx, cancelTask.ID); err != nil {
+	if _, err = (app.Tasks{Store: pgStore, Clock: time.Now}).Cancel(ctx, app.TaskRequest{ID: string(cancelTask.ID)}); err != nil {
 		unblock()
 		t.Fatal(err)
 	}
@@ -258,12 +262,12 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err = <-procDone; err != nil {
 		t.Fatal(err)
 	}
-	canceled, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, cancelTask.ID)
-	if err != nil || canceled.Status != task.Canceled {
+	canceled, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, app.TaskRequest{ID: string(cancelTask.ID)})
+	if err != nil || canceled.Status != string(task.Canceled) {
 		t.Fatalf("cancellation state=%+v err=%v", canceled, err)
 	}
 
-	leaseTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, cancelPayload)
+	leaseTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, app.SubmitTaskRequest{Payload: cancelPayload.JSON()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,14 +300,14 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	})
 	firstConsumer := app.Consumer{Store: pgStore, Clock: leaseClock, Lease: 60 * time.Millisecond, Timeout: time.Second, Processor: leaseProcessor}
 	firstDone := make(chan error, 1)
-	go func() { firstDone <- firstConsumer.Process(ctx, leaseTask.ID) }()
+	go func() { firstDone <- firstConsumer.Process(ctx, app.ProcessTaskRequest{ID: string(leaseTask.ID)}) }()
 	select {
 	case <-firstStarted:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
 	secondConsumer := app.Consumer{Store: pgStore, Clock: leaseClock, Lease: time.Second, Timeout: time.Second, Processor: leaseProcessor}
-	if err = secondConsumer.Process(ctx, leaseTask.ID); err != nil {
+	if err = secondConsumer.Process(ctx, app.ProcessTaskRequest{ID: string(leaseTask.ID)}); err != nil {
 		allowStaleFinish()
 		t.Fatal(err)
 	}
@@ -311,8 +315,8 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err = <-firstDone; err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, leaseTask.ID)
-	if err != nil || recovered.Status != task.Completed || recovered.Attempts != 2 || recovered.Result == nil || *recovered.Result != "new owner" {
+	recovered, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, app.TaskRequest{ID: string(leaseTask.ID)})
+	if err != nil || recovered.Status != string(task.Completed) || recovered.Attempts != 2 || recovered.Result == nil || *recovered.Result != "new owner" {
 		t.Fatalf("lease recovery=%+v err=%v", recovered, err)
 	}
 
@@ -386,7 +390,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	}
 	completedHTTP := submitHTTP()
 	instant := app.Consumer{Store: pgStore, Clock: time.Now, Lease: time.Second, Timeout: time.Second, Processor: integrationProcessorFunc(func(context.Context, task.Payload) (string, error) { return "complete", nil })}
-	if err = instant.Process(ctx, completedHTTP); err != nil {
+	if err = instant.Process(ctx, app.ProcessTaskRequest{ID: string(completedHTTP)}); err != nil {
 		t.Fatal(err)
 	}
 	response := cancelHTTP(completedHTTP)
@@ -409,7 +413,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	apiPhase, stopAPIPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopAPIPhase()
 	apiWorker := startConsumer(t, ctx, apiClient, 2, func(c context.Context, id task.ID) error {
-		err := instant.Process(c, id)
+		err := instant.Process(c, app.ProcessTaskRequest{ID: string(id)})
 		seen <- struct{}{}
 		return err
 	})
@@ -428,14 +432,14 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err = apiClient.Close(); err != nil {
 		t.Fatalf("API broker close: %v", err)
 	}
-	pendingState, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, pendingHTTP)
-	if err != nil || pendingState.Status != task.Canceled || pendingState.Attempts != 0 {
+	pendingState, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, app.TaskRequest{ID: string(pendingHTTP)})
+	if err != nil || pendingState.Status != string(task.Canceled) || pendingState.Attempts != 0 {
 		t.Fatalf("pending cancel state=%+v err=%v", pendingState, err)
 	}
 
 	// A transient storage failure is retried through RabbitMQ, then completed after the store recovers.
 	retryPayload, _ := task.NewPayload([]byte(`{"job":"storage-retry"}`))
-	retryTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, retryPayload)
+	retryTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, app.SubmitTaskRequest{Payload: retryPayload.JSON()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,12 +461,15 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	switchable := &switchStore{current: observedClosedStore}
 	retryConsumer := app.Consumer{Store: switchable, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(context.Context, task.Payload) (string, error) { return "recovered", nil })}
 	seenFailure := make(chan task.ID, 1)
-	retryWorker := startConsumer(t, ctx, retryClient, 1, func(c context.Context, id task.ID) error { seenFailure <- id; return retryConsumer.Process(c, id) })
+	retryWorker := startConsumer(t, ctx, retryClient, 1, func(c context.Context, id task.ID) error {
+		seenFailure <- id
+		return retryConsumer.Process(c, app.ProcessTaskRequest{ID: string(id)})
+	})
 	retryPhase, stopRetryPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopRetryPhase()
 	select {
 	case id := <-seenFailure:
-		if id != retryTask.ID {
+		if string(id) != retryTask.ID {
 			t.Fatalf("storage failure received unexpected task %s, wanted %s", id, retryTask.ID)
 		}
 	case <-retryPhase.Done():
@@ -478,7 +485,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	case <-retryWorker.done:
 		t.Fatalf("retry worker exited: %v", retryWorker.err)
 	}
-	retryState := waitForStatus(t, ctx, app.Tasks{Store: pgStore, Clock: time.Now}, retryTask.ID, task.Completed)
+	retryState := waitForStatus(t, ctx, app.Tasks{Store: pgStore, Clock: time.Now}, task.ID(retryTask.ID), task.Completed)
 	if retryState.Attempts != 1 || retryState.Result == nil || *retryState.Result != "recovered" {
 		t.Fatalf("storage retry result=%+v", retryState)
 	}
@@ -491,7 +498,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 
 	// A broker outage releases the claimed outbox lease; making it due again permits confirmed delivery.
 	failurePayload, _ := task.NewPayload([]byte(`{"job":"broker-retry"}`))
-	failureTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, failurePayload)
+	failureTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, app.SubmitTaskRequest{Payload: failurePayload.JSON()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,8 +521,10 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err != nil || count != 1 {
 		t.Fatalf("recovered relay count=%d err=%v", count, err)
 	}
-	recoveryWorker := startConsumer(t, ctx, failureClient, 1, func(c context.Context, id task.ID) error { return consumer.Process(c, id) })
-	recoveredFailure := waitForStatus(t, ctx, app.Tasks{Store: pgStore, Clock: time.Now}, failureTask.ID, task.Completed)
+	recoveryWorker := startConsumer(t, ctx, failureClient, 1, func(c context.Context, id task.ID) error {
+		return consumer.Process(c, app.ProcessTaskRequest{ID: string(id)})
+	})
+	recoveredFailure := waitForStatus(t, ctx, app.Tasks{Store: pgStore, Clock: time.Now}, task.ID(failureTask.ID), task.Completed)
 	if recoveredFailure.Attempts != 1 || recoveredFailure.Result == nil || *recoveredFailure.Result != "processed" {
 		t.Fatalf("recovered broker task=%+v", recoveredFailure)
 	}
@@ -528,7 +537,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 
 	// Closing a worker connection returns its unacked delivery. A new lease owner reclaims it.
 	shutdownPayload, _ := task.NewPayload([]byte(`{"job":"worker-restart"}`))
-	shutdownTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, shutdownPayload)
+	shutdownTask, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, app.SubmitTaskRequest{Payload: shutdownPayload.JSON()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +554,9 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 		<-c.Done()
 		return "", c.Err()
 	})}
-	shutdownWorker := startConsumer(t, ctx, shutdownClient, 1, func(c context.Context, id task.ID) error { return shutdownConsumer.Process(c, id) })
+	shutdownWorker := startConsumer(t, ctx, shutdownClient, 1, func(c context.Context, id task.ID) error {
+		return shutdownConsumer.Process(c, app.ProcessTaskRequest{ID: string(id)})
+	})
 	shutdownPhase, stopShutdownPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopShutdownPhase()
 	select {
@@ -561,15 +572,17 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err = shutdownClient.Close(); err != nil {
 		t.Fatalf("closing interrupted broker connection: %v", err)
 	}
-	interrupted, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, shutdownTask.ID)
-	if err != nil || interrupted.Status != task.Processing || interrupted.Attempts != 1 {
+	interrupted, err := (app.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, app.TaskRequest{ID: string(shutdownTask.ID)})
+	if err != nil || interrupted.Status != string(task.Processing) || interrupted.Attempts != 1 {
 		t.Fatalf("interrupted task=%+v err=%v", interrupted, err)
 	}
 	replacementClient := queueClient(host, port.Port(), "integration.shutdown")
 	t.Cleanup(func() { _ = replacementClient.Close() })
 	replacementConsumer := app.Consumer{Store: pgStore, Clock: func() time.Time { return firstTime.Add(101 * time.Millisecond) }, Lease: time.Second, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(context.Context, task.Payload) (string, error) { return "replacement", nil })}
-	replacementWorker := startConsumer(t, ctx, replacementClient, 1, func(c context.Context, id task.ID) error { return replacementConsumer.Process(c, id) })
-	restarted := waitForStatus(t, ctx, app.Tasks{Store: pgStore, Clock: time.Now}, shutdownTask.ID, task.Completed)
+	replacementWorker := startConsumer(t, ctx, replacementClient, 1, func(c context.Context, id task.ID) error {
+		return replacementConsumer.Process(c, app.ProcessTaskRequest{ID: string(id)})
+	})
+	restarted := waitForStatus(t, ctx, app.Tasks{Store: pgStore, Clock: time.Now}, task.ID(shutdownTask.ID), task.Completed)
 	if restarted.Attempts != 2 || restarted.Result == nil || *restarted.Result != "replacement" {
 		t.Fatalf("restarted worker result=%+v", restarted)
 	}
@@ -581,7 +594,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	}
 
 	_ = db.Close()
-	if _, err = pgStore.Get(ctx, created.ID); err == nil {
+	if _, err = pgStore.Get(ctx, task.ID(created.ID)); err == nil {
 		t.Fatal("database read unexpectedly succeeded after close")
 	}
 }
@@ -608,11 +621,12 @@ type runningConsumer struct {
 	err      error
 }
 
-func startConsumer(t *testing.T, parent context.Context, client *rabbitmq.Client, workers int, handler rabbitmq.Handler) *runningConsumer {
+func startConsumer(t *testing.T, parent context.Context, client *rabbitmq.Client, workers int, handler func(context.Context, task.ID) error) *runningConsumer {
 	t.Helper()
 	ctx, cancel := context.WithCancel(parent)
 	r := &runningConsumer{cancel: cancel, done: make(chan struct{})}
-	go func() { r.err = client.Consume(ctx, workers, handler); close(r.done) }()
+	processor := app.TaskProcessorFunc(func(c context.Context, req app.ProcessTaskRequest) error { return handler(c, task.ID(req.ID)) })
+	go func() { r.err = client.Consume(ctx, workers, processor); close(r.done) }()
 	t.Cleanup(func() { _ = r.Stop() })
 	return r
 }
@@ -624,12 +638,16 @@ func waitForStatus(t *testing.T, parent context.Context, tasks app.Tasks, id tas
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		state, err := tasks.Get(ctx, id)
+		state, err := tasks.Get(ctx, app.TaskRequest{ID: string(id)})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if state.Status == want {
-			return state
+		if state.Status == string(want) {
+			stored, storeErr := tasks.Store.Get(ctx, id)
+			if storeErr != nil {
+				t.Fatal(storeErr)
+			}
+			return stored.Snapshot()
 		}
 		select {
 		case <-ticker.C:

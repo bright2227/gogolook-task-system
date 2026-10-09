@@ -1,41 +1,26 @@
-# Domain and context map
+# Task lifecycle and terms
 
-## Task lifecycle
+## Lifecycle rules
 
-`Task` owns the lifecycle and accepts only valid transitions. Submission creates `pending` at version 0. A worker atomically claims a task as `processing`, increments its attempt count, and records a time-limited lease. A matching lease holder may finish it as `completed` with exactly one result or error. Expired leases can be reclaimed with a new token; the token fences out an older worker after reclamation. Cancellation is final and clears any lease. Repeating cancellation is an idempotent no-op, while cancellation after completion is a conflict.
+Tasks are independent work requests. Submission creates a `pending` task. A worker may claim it as `processing`, increasing its attempt count and receiving a time-limited lease. A matching lease holder can finish it as `completed` with exactly one result or error. An expired lease can be reclaimed with a new token; the new token prevents the former worker from overwriting the newer attempt.
+
+Cancellation is final and clears any lease. Repeating cancellation is an idempotent no-op. A completed task cannot be canceled. When cancellation and completion race, the database transaction that commits first determines the outcome. The system has four statuses: `pending`, `processing`, `completed`, and `canceled`.
+
+## Terms
 
 | Term | Meaning |
 | --- | --- |
-| Task | Work request, payload, lifecycle status, and outcome. |
-| Event | Immutable versioned fact such as `TaskSubmitted` or `TaskCompleted`. |
-| Outbox | Durable record created with `TaskSubmitted`, retried until broker confirmation is recorded. |
+| Task | A work request, JSON payload, lifecycle status, and eventual outcome. |
+| Event | An immutable versioned fact, such as `TaskSubmitted` or `TaskCompleted`. |
+| Outbox | A durable record created with `TaskSubmitted` and retried until broker confirmation is recorded. |
 | Relay | Claims outbox rows briefly, publishes outside the database transaction, and marks confirmed deliveries. |
-| Lease | Time-bounded ownership token for processing, used for crash recovery and fencing. |
-| Poison message | Invalid envelope or unknown task that cannot succeed; sent to the dead-letter queue. |
+| Lease | A time-limited ownership token for processing, used for crash recovery and fencing. |
+| Poison message | An invalid envelope or unknown task that cannot succeed and is sent to the dead-letter queue. |
 
-## Strategic boundary
+## Boundary notes
 
-The **Task Processing** bounded context owns the terms and rules above. Its core
-capability is coordinating independent work, cancellation, and recovery without
-allowing duplicate or stale executions to corrupt task state. Reliable delivery
-is a supporting capability inside this context; HTTP, PostgreSQL, and RabbitMQ
-are adapters rather than separate business contexts. Authentication and task
-dependencies are outside the assignment's scope.
+The task package owns lifecycle state and transition rules. It uses only the Go standard library and does not depend on HTTP, PostgreSQL, RabbitMQ, or the application package. The application coordinates these rules and storage through ports. The HTTP contract and broker envelope are adapter concerns; neither is a domain type.
 
-Clients consume the published HTTP contract. The broker envelope is the
-integration contract between the relay and workers; it carries task and event
-identities, while task state stays in PostgreSQL. Neither adapter contributes
-types to the domain model.
+`task.Snapshot` is the storage adapter's persistence projection. It includes fields needed to restore and safely update state, including version and lease data. It is not the response exposed to use cases or HTTP clients. The application maps snapshots to `app.TaskResponse`, which contains the task ID, payload, status, outcome, timestamps, and attempt count, without the persistence version, lease token, or event history.
 
-## Component relationships
-
-```text
-HTTP client -> HTTP API -> Task application -> Task domain
-                                  |                 |
-                                  v                 v
-                          PostgreSQL adapter <- task events/outbox
-                                  |
-                              Relay -> RabbitMQ -> Worker -> Task application
-```
-
-The domain has no infrastructure dependencies. Application services coordinate domain transitions through repository/store ports. PostgreSQL atomically stores task state, event history, and outbox rows. RabbitMQ provides at-least-once transport; it does not own task status. Worker execution and state changes are deliberately separate, so delivery can be repeated safely.
+PostgreSQL is the source of truth for task status. RabbitMQ provides at-least-once transport, so duplicate delivery is expected and safe. Worker execution and state changes are separate: a consumer claims the task, performs work, and commits the outcome under the current lease.

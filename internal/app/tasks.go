@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/bright2227/vsx-task-system/internal/task"
@@ -12,24 +13,42 @@ type Tasks struct {
 	Clock Clock
 }
 
-func (s Tasks) Submit(ctx context.Context, p task.Payload) (task.Snapshot, error) {
+var _ TaskUseCases = Tasks{}
+
+func (s Tasks) Submit(ctx context.Context, req SubmitTaskRequest) (TaskResponse, error) {
+	p, err := task.NewPayload(req.Payload)
+	if err != nil {
+		return TaskResponse{}, ErrInvalidPayload
+	}
 	t, err := task.Submit(p, s.Clock())
 	if err != nil {
-		return task.Snapshot{}, err
+		return TaskResponse{}, mapTaskError(err)
 	}
-	err = s.Store.Within(ctx, func(r Repository) error { return r.Insert(ctx, t) })
-	return t.Snapshot(), err
+	if err = s.Store.Within(ctx, func(r Repository) error { return r.Insert(ctx, t) }); err != nil {
+		return TaskResponse{}, mapTaskError(err)
+	}
+	return response(t.Snapshot()), nil
 }
-func (s Tasks) Get(ctx context.Context, id task.ID) (task.Snapshot, error) {
+
+func (s Tasks) Get(ctx context.Context, req TaskRequest) (TaskResponse, error) {
+	id, err := parseID(req.ID)
+	if err != nil {
+		return TaskResponse{}, err
+	}
 	t, err := s.Store.Get(ctx, id)
 	if err != nil {
-		return task.Snapshot{}, err
+		return TaskResponse{}, mapTaskError(err)
 	}
-	return t.Snapshot(), nil
+	return response(t.Snapshot()), nil
 }
-func (s Tasks) Cancel(ctx context.Context, id task.ID) (task.Snapshot, error) {
-	var out task.Snapshot
-	err := s.Store.Within(ctx, func(r Repository) error {
+
+func (s Tasks) Cancel(ctx context.Context, req TaskRequest) (TaskResponse, error) {
+	id, err := parseID(req.ID)
+	if err != nil {
+		return TaskResponse{}, err
+	}
+	var out TaskResponse
+	err = s.Store.Within(ctx, func(r Repository) error {
 		t, err := r.Get(ctx, id)
 		if err != nil {
 			return err
@@ -44,10 +63,52 @@ func (s Tasks) Cancel(ctx context.Context, id task.ID) (task.Snapshot, error) {
 				return err
 			}
 		}
-		out = t.Snapshot()
+		out = response(t.Snapshot())
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return TaskResponse{}, mapTaskError(err)
+	}
+	return out, nil
+}
+
+func parseID(raw string) (task.ID, error) {
+	id, err := task.ParseID(raw)
+	if err != nil {
+		return "", ErrInvalidID
+	}
+	return id, nil
+}
+
+func response(s task.Snapshot) TaskResponse {
+	out := TaskResponse{
+		ID: string(s.ID), Payload: append([]byte(nil), s.Payload.JSON()...), Status: string(s.Status),
+		CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt, Attempts: s.Attempts,
+	}
+	if s.Result != nil {
+		v := *s.Result
+		out.Result = &v
+	}
+	if s.Error != nil {
+		v := *s.Error
+		out.Error = &v
+	}
+	return out
+}
+
+func mapTaskError(err error) error {
+	switch {
+	case errors.Is(err, task.ErrPayload):
+		return ErrInvalidPayload
+	case errors.Is(err, task.ErrCompleted):
+		return ErrCompleted
+	case errors.Is(err, task.ErrBusy):
+		return ErrBusy
+	case errors.Is(err, ErrNotFound), errors.Is(err, ErrConflict):
+		return err
+	default:
+		return err
+	}
 }
 
 type Consumer struct {
@@ -58,11 +119,17 @@ type Consumer struct {
 	Timeout   time.Duration
 }
 
-func (c Consumer) Process(ctx context.Context, id task.ID) error {
+var _ TaskProcessor = Consumer{}
+
+func (c Consumer) Process(ctx context.Context, req ProcessTaskRequest) error {
+	id, err := parseID(req.ID)
+	if err != nil {
+		return err
+	}
 	token := task.NewID()
 	var payload task.Payload
 	started := false
-	err := c.Store.Within(ctx, func(r Repository) error {
+	err = c.Store.Within(ctx, func(r Repository) error {
 		t, err := r.Get(ctx, id)
 		if err != nil {
 			return err
@@ -76,7 +143,7 @@ func (c Consumer) Process(ctx context.Context, id task.ID) error {
 		return r.Save(ctx, t, s.Version)
 	})
 	if err != nil || !started {
-		return err
+		return mapTaskError(err)
 	}
 	workCtx, cancel := context.WithTimeout(ctx, c.Timeout)
 	defer cancel()
@@ -93,7 +160,7 @@ func (c Consumer) Process(ctx context.Context, id task.ID) error {
 		failure := "task execution failed"
 		failurePtr = &failure
 	}
-	return c.Store.Within(ctx, func(r Repository) error {
+	err = c.Store.Within(ctx, func(r Repository) error {
 		t, err := r.Get(ctx, id)
 		if err != nil {
 			return err
@@ -105,4 +172,5 @@ func (c Consumer) Process(ctx context.Context, id task.ID) error {
 		}
 		return r.Save(ctx, t, version)
 	})
+	return mapTaskError(err)
 }

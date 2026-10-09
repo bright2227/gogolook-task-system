@@ -1,6 +1,8 @@
 # VSX Task System
 
-A small asynchronous task service built around a four-state lifecycle: `pending`, `processing`, `completed`, and `canceled`. The HTTP API stores a task with its submission event and outbox record in one PostgreSQL transaction. A relay publishes outbox messages to durable RabbitMQ queues with publisher confirms; workers execute each job asynchronously (the sample processor takes three seconds) and persist the terminal outcome. PostgreSQL remains the source of truth, so duplicate messages are safe and processing leases allow recovery after worker loss.
+A Go asynchronous task service using Clean Architecture and a four-state lifecycle: `pending`, `processing`, `completed`, and `canceled`. Delivery adapters call application-owned input interfaces with request DTOs; use cases validate inputs, apply task rules, and return response DTOs. PostgreSQL and RabbitMQ implement the application's output ports, and `cmd` packages wire concrete implementations together.
+
+The HTTP API stores a task with its submission event and outbox record in one PostgreSQL transaction. A relay publishes outbox messages to durable RabbitMQ queues with publisher confirms; workers execute each job asynchronously (the sample processor takes three seconds) and persist the terminal outcome. PostgreSQL remains the source of truth, so duplicate messages are safe and processing leases allow recovery after worker loss.
 
 ## Run the stack
 
@@ -21,7 +23,7 @@ curl http://localhost:8080/tasks/TASK_ID
 curl -X POST http://localhost:8080/tasks/TASK_ID:cancel
 ```
 
-Creation returns `202 Accepted`. Cancellation is idempotent while canceled; completed tasks return `409 Conflict` when cancellation is requested. A cancellation racing with execution wins if it commits first, and a worker's stale lease cannot overwrite it. Payloads must be JSON no larger than 64 KiB. See [domain notes](docs/domain.md), [design decision](docs/adr-001-persistence-and-delivery.md), and [requirement mapping](docs/requirements.md).
+Creation returns `202 Accepted`. Cancellation is idempotent while canceled; completed tasks return `409 Conflict` when cancellation is requested. A cancellation racing with execution wins if it commits first, and a worker's stale lease cannot overwrite it. Payloads must be JSON no larger than 64 KiB. See the [architecture guide](docs/architecture.md), [task lifecycle and terms](docs/domain.md), [design decision](docs/adr-001-persistence-and-delivery.md), and [requirement mapping](docs/requirements.md).
 
 ## Develop and validate
 
@@ -31,4 +33,8 @@ Install the Go module dependencies with `make deps`. The default Go suite, race 
 go test -tags=integration -v ./tests/integration
 ```
 
-It requires a working Docker daemon and the Go module dependencies. In the current development environment Docker socket access is denied and dependencies are not locally cached, so full builds and the integration suite have not been verified here. CI is configured to run them on a Docker-enabled GitHub-hosted runner. Core unit tests, race checks, and vet pass for the domain, application, and HTTP packages; Compose configuration validation also passes. The Compose stack is intended for longer manual runs. Once it is running, a concurrent create-and-poll load run can be started with `make load`; tune duration, concurrency, and poll interval via `go run ./cmd/load -h`.
+It requires a working Docker daemon and the Go module dependencies. In the current development environment Docker socket access is denied and dependency checksums/modules are unavailable, so full builds and the integration suite remain uncompiled and unrun here. CI is configured to run them on a Docker-enabled GitHub-hosted runner.
+
+`make test-core` runs race-enabled tests for the entity, use cases, HTTP adapter, and dependency boundaries, and compiles the memory and processor adapters. These checks and vet pass without third-party dependencies. The architecture test rejects outward imports from the entity/use-case layers and direct domain imports from the HTTP adapter. Compose configuration validation also passes; this does not verify running containers.
+
+The Compose stack is intended for longer manual runs. Once it is running, a concurrent create-and-poll load run can be started with `make load`; tune duration, concurrency, and poll interval via `go run ./cmd/load -h`.

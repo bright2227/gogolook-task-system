@@ -1,10 +1,13 @@
-.PHONY: deps test race vet build integration up down load
+.PHONY: deps test test-core race vet build integration up down load
 
 deps:
 	go mod tidy
 
 test:
 	go test ./...
+
+test-core:
+	go test -race ./internal/task ./internal/app ./internal/adapter/memory ./internal/adapter/httpapi ./internal/adapter/processor ./tests/architecture
 
 race:
 	go test -race ./...
