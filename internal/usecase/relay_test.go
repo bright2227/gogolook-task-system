@@ -1,4 +1,4 @@
-package app_test
+package usecase_test
 
 import (
 	"context"
@@ -6,33 +6,33 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bright2227/vsx-task-system/internal/app"
-	"github.com/bright2227/vsx-task-system/internal/task"
+	"github.com/bright2227/vsx-task-system/internal/domain"
+	"github.com/bright2227/vsx-task-system/internal/usecase"
 )
 
 type outboxStub struct {
 	mu                                   sync.Mutex
-	message                              app.Message
+	message                              usecase.Message
 	reserveErr, publishedErr, releaseErr error
 	reserved, marked, released           int
 }
 
-func (o *outboxStub) Reserve(context.Context, int) ([]app.Message, error) {
+func (o *outboxStub) Reserve(context.Context, int) ([]usecase.Message, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.reserved++
 	if o.reserveErr != nil {
 		return nil, o.reserveErr
 	}
-	return []app.Message{o.message}, nil
+	return []usecase.Message{o.message}, nil
 }
-func (o *outboxStub) Published(context.Context, app.Message) error {
+func (o *outboxStub) Published(context.Context, usecase.Message) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.marked++
 	return o.publishedErr
 }
-func (o *outboxStub) Release(context.Context, app.Message) error {
+func (o *outboxStub) Release(context.Context, usecase.Message) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.released++
@@ -44,15 +44,15 @@ type publisherStub struct {
 	calls int
 }
 
-func (p *publisherStub) Publish(context.Context, app.Message) error { p.calls++; return p.err }
+func (p *publisherStub) Publish(context.Context, usecase.Message) error { p.calls++; return p.err }
 
 func TestRelayReleasesFailedPublishAndMarksConfirmedPublish(t *testing.T) {
-	message := app.Message{EventID: task.NewID(), TaskID: task.NewID()}
+	message := usecase.Message{EventID: domain.NewID(), TaskID: domain.NewID()}
 	t.Run("publish failure releases lease", func(t *testing.T) {
 		want := errors.New("broker unavailable")
 		outbox := &outboxStub{message: message}
 		publisher := &publisherStub{err: want}
-		count, err := (app.Relay{Outbox: outbox, Publisher: publisher, Batch: 1}).Once(context.Background())
+		count, err := (usecase.Relay{Outbox: outbox, Publisher: publisher, Batch: 1}).Once(context.Background())
 		if count != 0 || !errors.Is(err, want) || publisher.calls != 1 || outbox.marked != 0 || outbox.released != 1 {
 			t.Fatalf("count=%d err=%v publisher=%+v outbox=%+v", count, err, publisher, outbox)
 		}
@@ -60,7 +60,7 @@ func TestRelayReleasesFailedPublishAndMarksConfirmedPublish(t *testing.T) {
 	t.Run("confirmed publish marks outbox", func(t *testing.T) {
 		outbox := &outboxStub{message: message}
 		publisher := &publisherStub{}
-		count, err := (app.Relay{Outbox: outbox, Publisher: publisher, Batch: 1}).Once(context.Background())
+		count, err := (usecase.Relay{Outbox: outbox, Publisher: publisher, Batch: 1}).Once(context.Background())
 		if count != 1 || err != nil || publisher.calls != 1 || outbox.marked != 1 || outbox.released != 0 {
 			t.Fatalf("count=%d err=%v publisher=%+v outbox=%+v", count, err, publisher, outbox)
 		}

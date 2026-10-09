@@ -4,14 +4,36 @@ A Go asynchronous task service using Clean Architecture and a four-state lifecyc
 
 The HTTP API stores a task with its submission event and outbox record in one PostgreSQL transaction. A relay publishes outbox messages to durable RabbitMQ queues with publisher confirms; workers execute each job asynchronously (the sample processor takes three seconds) and persist the terminal outcome. PostgreSQL remains the source of truth, so duplicate messages are safe and processing leases allow recovery after worker loss.
 
+The layout follows the original client project's layer names:
+
+```text
+cmd/                         # server, worker, relay, load runner
+internal/
+  configs/                   # environment configuration
+  domain/                    # task entity and lifecycle rules
+  usecase/                   # operations, DTOs, input/output interfaces
+  delivery/
+    http/                    # HTTP handlers and presentation
+    rabbitmq/                # broker transport and worker delivery
+  repository/task/
+    postgres/                # durable storage and outbox
+    memory/                  # transactional test double
+  infrastructure/processor/  # simulated task execution
+  migrations/                # SQL schema
+deployments/                 # Dockerfile and docker-compose.yml
+tests/                       # architecture and Testcontainers checks
+```
+
+Repository implementations live under `repository`; their interfaces stay in `usecase` so dependencies point inward. HTTP delivery uses Go's `net/http` package.
+
 ## Run the stack
 
 Requires Docker Compose. The stack publishes the API at `http://localhost:8080`, PostgreSQL on `5432`, and RabbitMQ on `5672` (`15672` management UI). The Compose database is initialized from the migration on its first start.
 
-The migration mount runs only when PostgreSQL initializes a new data volume. To apply the initial schema to an existing empty database, run `docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U task -d tasks < migrations/001_initial.sql`. Future schema changes need new versioned migrations.
+The migration mount runs only when PostgreSQL initializes a new data volume. To apply the initial schema to an existing empty database, run `docker compose -f deployments/docker-compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U task -d tasks < internal/migrations/001_initial.sql`. Future schema changes need new versioned migrations.
 
 ```sh
-docker compose up --build --scale worker=2
+docker compose -f deployments/docker-compose.yml up --build --scale worker=2
 ```
 
 Submit, inspect, and cancel tasks:

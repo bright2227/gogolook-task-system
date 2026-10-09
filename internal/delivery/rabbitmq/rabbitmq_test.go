@@ -5,12 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/task"
+	"github.com/bright2227/vsx-task-system/internal/domain"
 )
 
 func TestDecodeValidTaskMessage(t *testing.T) {
-	taskID := task.NewID()
-	eventID := task.NewID()
+	taskID := domain.NewID()
+	eventID := domain.NewID()
 	m, err := decode([]byte(`{"event_id":"` + string(eventID) + `","task_id":"` + string(taskID) + `"}`))
 	if err != nil {
 		t.Fatal(err)

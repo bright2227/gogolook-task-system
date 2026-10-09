@@ -1,4 +1,4 @@
-package runtime
+package configs
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/adapter/rabbitmq"
+	"github.com/bright2227/vsx-task-system/internal/delivery/rabbitmq"
 )
 
 type Config struct {

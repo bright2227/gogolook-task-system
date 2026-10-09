@@ -1,11 +1,11 @@
-package app
+package usecase
 
 import (
 	"context"
 	"errors"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/task"
+	"github.com/bright2227/vsx-task-system/internal/domain"
 )
 
 type Tasks struct {
@@ -16,11 +16,11 @@ type Tasks struct {
 var _ TaskUseCases = Tasks{}
 
 func (s Tasks) Submit(ctx context.Context, req SubmitTaskRequest) (TaskResponse, error) {
-	p, err := task.NewPayload(req.Payload)
+	p, err := domain.NewPayload(req.Payload)
 	if err != nil {
 		return TaskResponse{}, ErrInvalidPayload
 	}
-	t, err := task.Submit(p, s.Clock())
+	t, err := domain.Submit(p, s.Clock())
 	if err != nil {
 		return TaskResponse{}, mapTaskError(err)
 	}
@@ -72,15 +72,15 @@ func (s Tasks) Cancel(ctx context.Context, req TaskRequest) (TaskResponse, error
 	return out, nil
 }
 
-func parseID(raw string) (task.ID, error) {
-	id, err := task.ParseID(raw)
+func parseID(raw string) (domain.ID, error) {
+	id, err := domain.ParseID(raw)
 	if err != nil {
 		return "", ErrInvalidID
 	}
 	return id, nil
 }
 
-func response(s task.Snapshot) TaskResponse {
+func response(s domain.Snapshot) TaskResponse {
 	out := TaskResponse{
 		ID: string(s.ID), Payload: append([]byte(nil), s.Payload.JSON()...), Status: string(s.Status),
 		CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt, Attempts: s.Attempts,
@@ -98,11 +98,11 @@ func response(s task.Snapshot) TaskResponse {
 
 func mapTaskError(err error) error {
 	switch {
-	case errors.Is(err, task.ErrPayload):
+	case errors.Is(err, domain.ErrPayload):
 		return ErrInvalidPayload
-	case errors.Is(err, task.ErrCompleted):
+	case errors.Is(err, domain.ErrCompleted):
 		return ErrCompleted
-	case errors.Is(err, task.ErrBusy):
+	case errors.Is(err, domain.ErrBusy):
 		return ErrBusy
 	case errors.Is(err, ErrNotFound), errors.Is(err, ErrConflict):
 		return err
@@ -126,8 +126,8 @@ func (c Consumer) Process(ctx context.Context, req ProcessTaskRequest) error {
 	if err != nil {
 		return err
 	}
-	token := task.NewID()
-	var payload task.Payload
+	token := domain.NewID()
+	var payload domain.Payload
 	started := false
 	err = c.Store.Within(ctx, func(r Repository) error {
 		t, err := r.Get(ctx, id)

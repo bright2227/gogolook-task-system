@@ -1,6 +1,8 @@
 # Clean Architecture
 
-The Go module and project layout remain in place. The architecture change makes the task use cases the boundary between delivery adapters and task rules: the HTTP adapter depends on application interfaces and transport-neutral request/response types, while the task package remains independent of adapters and infrastructure.
+The package layout follows the original client's `domain`, `usecase`, `delivery`, `repository`, and `configs` conventions. Task execution adds an `infrastructure/processor` implementation. SQL migrations live in `internal/migrations`, and container files live in `deployments`.
+
+Use cases form the boundary between delivery and task rules: HTTP depends on use-case interfaces and request/response DTOs, while the domain remains independent of delivery and infrastructure. Storage interfaces belong to `usecase`; PostgreSQL and memory implementations live in `repository/task`.
 
 ## Dependency structure
 
@@ -25,7 +27,7 @@ flowchart LR
     RELAY --> MQ
 ```
 
-Arrows show source dependencies. In particular, `httpapi` imports `app` and owns its HTTP JSON presenter; it does not import `task`. The application translates transport-neutral input into task values, invokes lifecycle rules, and maps results into use-case responses. PostgreSQL and in-memory stores implement the application's storage ports. The RabbitMQ adapter accepts the application processor interface. The simulated three-second processor implements the application's processing port.
+Arrows show source dependencies. In particular, `delivery/http` imports `usecase` and owns its HTTP JSON presenter; it does not import `domain`. The application translates transport-neutral input into task values, invokes lifecycle rules, and maps results into use-case responses. PostgreSQL and in-memory stores implement the application's storage ports. The RabbitMQ adapter accepts the application processor interface. The simulated three-second processor implements the application's processing port.
 
 At runtime, data flows through those dependencies in both directions:
 
@@ -60,7 +62,7 @@ sequenceDiagram
 
 ## Inbound application contracts
 
-`app.TaskUseCases` is implemented by `app.Tasks` and provides:
+`usecase.TaskUseCases` is implemented by `usecase.Tasks` and provides:
 
 | Operation | Input | Output |
 | --- | --- | --- |
@@ -68,7 +70,7 @@ sequenceDiagram
 | Get | `TaskRequest` with task ID string | `TaskResponse` |
 | Cancel | `TaskRequest` with task ID string | `TaskResponse` |
 
-`app.TaskProcessor` exposes `Process` with a `ProcessTaskRequest` containing the task ID string. The RabbitMQ adapter invokes this interface for a decoded task message. These use-case inputs do not require HTTP request types or domain entity pointers.
+`usecase.TaskProcessor` exposes `Process` with a `ProcessTaskRequest` containing the task ID string. The RabbitMQ adapter invokes this interface for a decoded task message. These use-case inputs do not require HTTP request types or domain entity pointers.
 
 `TaskResponse` carries ID, payload, status, optional result or error, creation and update times, and attempt count. The HTTP adapter presents this as JSON. The application validates payload and ID inputs and returns application errors; the HTTP adapter maps those errors to status codes and error JSON.
 
@@ -84,11 +86,11 @@ The application declares the interfaces it needs; adapters satisfy them:
 | `Processor` | Execute task payload and return a result or error | Simulated processor |
 | `Clock` | Supply application time for transitions | Composition roots provide `time.Now` |
 
-The application package imports the task package to apply the lifecycle rules and uses these outbound contracts to access storage and execution. Infrastructure adapters depend inward on the contracts they implement.
+The usecase package imports the domain package to apply the lifecycle rules and uses these outbound contracts to access storage and execution. Infrastructure adapters depend inward on the contracts they implement.
 
 ## Persistence projection and use-case response
 
-The entity's `task.Snapshot` is used to restore and persist the task. It carries internal concurrency and recovery fields such as version, lease token, and lease deadline; event history is available separately from the task entity. Storage adapters need these details to perform optimistic updates and recover processing after worker loss.
+The entity's `domain.Snapshot` is used to restore and persist the task. It carries internal concurrency and recovery fields such as version, lease token, and lease deadline; event history is available separately from the task entity. Storage adapters need these details to perform optimistic updates and recover processing after worker loss.
 
 The use-case `TaskResponse` is a separate projection for callers. It deliberately omits version, lease details, and events. Consequently, database schema needs do not dictate the public HTTP response, and the HTTP adapter does not expose persistence state by serializing an entity or snapshot.
 

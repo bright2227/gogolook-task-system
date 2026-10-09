@@ -10,20 +10,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/adapter/memory"
-	"github.com/bright2227/vsx-task-system/internal/app"
-	"github.com/bright2227/vsx-task-system/internal/task"
+	"github.com/bright2227/vsx-task-system/internal/domain"
+	"github.com/bright2227/vsx-task-system/internal/repository/task/memory"
+	"github.com/bright2227/vsx-task-system/internal/usecase"
 )
 
 type fakeTasks struct {
-	submit func(context.Context, app.SubmitTaskRequest) (app.TaskResponse, error)
-	get    func(context.Context, app.TaskRequest) (app.TaskResponse, error)
-	cancel func(context.Context, app.TaskRequest) (app.TaskResponse, error)
+	submit func(context.Context, usecase.SubmitTaskRequest) (usecase.TaskResponse, error)
+	get    func(context.Context, usecase.TaskRequest) (usecase.TaskResponse, error)
+	cancel func(context.Context, usecase.TaskRequest) (usecase.TaskResponse, error)
 }
 
 func TestTaskHTTPFlowAndValidation(t *testing.T) {
 	store := memory.New()
-	service := app.Tasks{Store: store, Clock: time.Now}
+	service := usecase.Tasks{Store: store, Clock: time.Now}
 	api := (&API{Tasks: service, Ready: func(context.Context) error { return nil }}).Handler()
 	call := func(method, path, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -48,12 +48,12 @@ func TestTaskHTTPFlowAndValidation(t *testing.T) {
 	if got := call(http.MethodPost, "/tasks/"+item.ID+":cancel", ""); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"status":"canceled"`) {
 		t.Fatalf("repeated cancel status=%d body=%s", got.Code, got.Body)
 	}
-	completed, err := service.Submit(context.Background(), app.SubmitTaskRequest{Payload: []byte(`{}`)})
+	completed, err := service.Submit(context.Background(), usecase.SubmitTaskRequest{Payload: []byte(`{}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	completion := app.Consumer{Store: store, Clock: time.Now, Lease: time.Second, Timeout: time.Second, Processor: funcProcessor(func(context.Context, task.Payload) (string, error) { return "ok", nil })}
-	if err = completion.Process(context.Background(), app.ProcessTaskRequest{ID: completed.ID}); err != nil {
+	completion := usecase.Consumer{Store: store, Clock: time.Now, Lease: time.Second, Timeout: time.Second, Processor: funcProcessor(func(context.Context, domain.Payload) (string, error) { return "ok", nil })}
+	if err = completion.Process(context.Background(), usecase.ProcessTaskRequest{ID: completed.ID}); err != nil {
 		t.Fatal(err)
 	}
 	if got := call(http.MethodPost, "/tasks/"+completed.ID+":cancel", ""); got.Code != http.StatusConflict {
@@ -76,17 +76,19 @@ func TestTaskHTTPFlowAndValidation(t *testing.T) {
 	}
 }
 
-type funcProcessor func(context.Context, task.Payload) (string, error)
+type funcProcessor func(context.Context, domain.Payload) (string, error)
 
-func (f funcProcessor) Execute(ctx context.Context, p task.Payload) (string, error) { return f(ctx, p) }
+func (f funcProcessor) Execute(ctx context.Context, p domain.Payload) (string, error) {
+	return f(ctx, p)
+}
 
-func (f fakeTasks) Submit(c context.Context, r app.SubmitTaskRequest) (app.TaskResponse, error) {
+func (f fakeTasks) Submit(c context.Context, r usecase.SubmitTaskRequest) (usecase.TaskResponse, error) {
 	return f.submit(c, r)
 }
-func (f fakeTasks) Get(c context.Context, r app.TaskRequest) (app.TaskResponse, error) {
+func (f fakeTasks) Get(c context.Context, r usecase.TaskRequest) (usecase.TaskResponse, error) {
 	return f.get(c, r)
 }
-func (f fakeTasks) Cancel(c context.Context, r app.TaskRequest) (app.TaskResponse, error) {
+func (f fakeTasks) Cancel(c context.Context, r usecase.TaskRequest) (usecase.TaskResponse, error) {
 	return f.cancel(c, r)
 }
 
@@ -94,17 +96,17 @@ func TestHTTPTranslatesRequestsAndPresentsResponses(t *testing.T) {
 	var gotPayload []byte
 	var gotID string
 	fake := fakeTasks{
-		submit: func(_ context.Context, req app.SubmitTaskRequest) (app.TaskResponse, error) {
+		submit: func(_ context.Context, req usecase.SubmitTaskRequest) (usecase.TaskResponse, error) {
 			gotPayload = append([]byte(nil), req.Payload...)
-			return app.TaskResponse{ID: "abc", Payload: req.Payload, Status: "pending", CreatedAt: time.Unix(1, 0)}, nil
+			return usecase.TaskResponse{ID: "abc", Payload: req.Payload, Status: "pending", CreatedAt: time.Unix(1, 0)}, nil
 		},
-		get: func(_ context.Context, req app.TaskRequest) (app.TaskResponse, error) {
+		get: func(_ context.Context, req usecase.TaskRequest) (usecase.TaskResponse, error) {
 			gotID = req.ID
-			return app.TaskResponse{ID: req.ID, Payload: []byte(`{"n":1}`), Status: "completed", Attempts: 2}, nil
+			return usecase.TaskResponse{ID: req.ID, Payload: []byte(`{"n":1}`), Status: "completed", Attempts: 2}, nil
 		},
-		cancel: func(_ context.Context, req app.TaskRequest) (app.TaskResponse, error) {
+		cancel: func(_ context.Context, req usecase.TaskRequest) (usecase.TaskResponse, error) {
 			gotID = req.ID
-			return app.TaskResponse{ID: req.ID, Status: "canceled"}, nil
+			return usecase.TaskResponse{ID: req.ID, Status: "canceled"}, nil
 		},
 	}
 	api := (&API{Tasks: fake, Ready: func(context.Context) error { return nil }}).Handler()
@@ -136,10 +138,14 @@ func TestHTTPMapsApplicationErrorsAndRetainsBodyValidation(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		want int
-	}{{app.ErrInvalidID, 400}, {app.ErrInvalidPayload, 422}, {app.ErrCompleted, 409}, {app.ErrConflict, 409}, {app.ErrNotFound, 404}, {errors.New("db unavailable"), 503}} {
-		fake := fakeTasks{submit: func(context.Context, app.SubmitTaskRequest) (app.TaskResponse, error) {
-			return app.TaskResponse{}, tc.err
-		}, get: func(context.Context, app.TaskRequest) (app.TaskResponse, error) { return app.TaskResponse{}, tc.err }, cancel: func(context.Context, app.TaskRequest) (app.TaskResponse, error) { return app.TaskResponse{}, tc.err }}
+	}{{usecase.ErrInvalidID, 400}, {usecase.ErrInvalidPayload, 422}, {usecase.ErrCompleted, 409}, {usecase.ErrConflict, 409}, {usecase.ErrNotFound, 404}, {errors.New("db unavailable"), 503}} {
+		fake := fakeTasks{submit: func(context.Context, usecase.SubmitTaskRequest) (usecase.TaskResponse, error) {
+			return usecase.TaskResponse{}, tc.err
+		}, get: func(context.Context, usecase.TaskRequest) (usecase.TaskResponse, error) {
+			return usecase.TaskResponse{}, tc.err
+		}, cancel: func(context.Context, usecase.TaskRequest) (usecase.TaskResponse, error) {
+			return usecase.TaskResponse{}, tc.err
+		}}
 		api := (&API{Tasks: fake, Ready: func(context.Context) error { return nil }}).Handler()
 		w := httptest.NewRecorder()
 		api.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/tasks/id", nil))
@@ -147,9 +153,9 @@ func TestHTTPMapsApplicationErrorsAndRetainsBodyValidation(t *testing.T) {
 			t.Errorf("error %v: status=%d want %d", tc.err, w.Code, tc.want)
 		}
 	}
-	fake := fakeTasks{submit: func(context.Context, app.SubmitTaskRequest) (app.TaskResponse, error) {
+	fake := fakeTasks{submit: func(context.Context, usecase.SubmitTaskRequest) (usecase.TaskResponse, error) {
 		t.Fatal("invalid body reached application")
-		return app.TaskResponse{}, nil
+		return usecase.TaskResponse{}, nil
 	}}
 	api := (&API{Tasks: fake, Ready: func(context.Context) error { return nil }}).Handler()
 	for _, body := range []string{`{"payload":{} ,"surprise":1}`, `{"payload":{}} {}`} {

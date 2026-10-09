@@ -1,11 +1,11 @@
-package app
+package usecase
 
 import (
 	"context"
 	"errors"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/task"
+	"github.com/bright2227/vsx-task-system/internal/domain"
 )
 
 var (
@@ -47,23 +47,23 @@ func (f TaskProcessorFunc) Process(ctx context.Context, req ProcessTaskRequest) 
 }
 
 type Repository interface {
-	Get(context.Context, task.ID) (*task.Task, error)
-	Insert(context.Context, *task.Task) error
-	Save(context.Context, *task.Task, int64) error
+	Get(context.Context, domain.ID) (*domain.Task, error)
+	Insert(context.Context, *domain.Task) error
+	Save(context.Context, *domain.Task, int64) error
 }
 type Store interface {
-	Get(context.Context, task.ID) (*task.Task, error)
+	Get(context.Context, domain.ID) (*domain.Task, error)
 	Within(context.Context, func(Repository) error) error
 }
 type Processor interface {
-	Execute(context.Context, task.Payload) (string, error)
+	Execute(context.Context, domain.Payload) (string, error)
 }
 type Clock func() time.Time
 
 type Message struct {
-	EventID task.ID
-	TaskID  task.ID
-	Token   task.ID
+	EventID domain.ID
+	TaskID  domain.ID
+	Token   domain.ID
 }
 type Outbox interface {
 	Reserve(context.Context, int) ([]Message, error)

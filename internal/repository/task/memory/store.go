@@ -5,30 +5,30 @@ import (
 	"context"
 	"sync"
 
-	"github.com/bright2227/vsx-task-system/internal/app"
-	"github.com/bright2227/vsx-task-system/internal/task"
+	"github.com/bright2227/vsx-task-system/internal/domain"
+	"github.com/bright2227/vsx-task-system/internal/usecase"
 )
 
 type Store struct {
 	mu     sync.Mutex
-	tasks  map[task.ID]task.Snapshot
-	Events []task.Event
-	Outbox []app.Message
+	tasks  map[domain.ID]domain.Snapshot
+	Events []domain.Event
+	Outbox []usecase.Message
 }
 
-func New() *Store { return &Store{tasks: make(map[task.ID]task.Snapshot)} }
-func (s *Store) Get(ctx context.Context, id task.ID) (*task.Task, error) {
+func New() *Store { return &Store{tasks: make(map[domain.ID]domain.Snapshot)} }
+func (s *Store) Get(ctx context.Context, id domain.ID) (*domain.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return (&repo{tasks: s.tasks}).Get(ctx, id)
 }
-func (s *Store) Within(ctx context.Context, fn func(app.Repository) error) error {
+func (s *Store) Within(ctx context.Context, fn func(usecase.Repository) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r := &repo{tasks: make(map[task.ID]task.Snapshot), knownEvents: make(map[task.ID]bool)}
+	r := &repo{tasks: make(map[domain.ID]domain.Snapshot), knownEvents: make(map[domain.ID]bool)}
 	for _, event := range s.Events {
 		r.knownEvents[event.ID] = true
 	}
@@ -48,23 +48,23 @@ func (s *Store) Within(ctx context.Context, fn func(app.Repository) error) error
 }
 
 type repo struct {
-	tasks       map[task.ID]task.Snapshot
-	events      []task.Event
-	outbox      []app.Message
-	knownEvents map[task.ID]bool
+	tasks       map[domain.ID]domain.Snapshot
+	events      []domain.Event
+	outbox      []usecase.Message
+	knownEvents map[domain.ID]bool
 }
 
-func (r *repo) Get(ctx context.Context, id task.ID) (*task.Task, error) {
+func (r *repo) Get(ctx context.Context, id domain.ID) (*domain.Task, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	s, ok := r.tasks[id]
 	if !ok {
-		return nil, app.ErrNotFound
+		return nil, usecase.ErrNotFound
 	}
-	return task.Restore(s)
+	return domain.Restore(s)
 }
-func (r *repo) record(t *task.Task) {
+func (r *repo) record(t *domain.Task) {
 	for _, e := range t.Events() {
 		if r.knownEvents[e.ID] {
 			continue
@@ -72,33 +72,33 @@ func (r *repo) record(t *task.Task) {
 		r.knownEvents[e.ID] = true
 		r.events = append(r.events, e)
 		if e.Name == "TaskSubmitted" {
-			r.outbox = append(r.outbox, app.Message{EventID: e.ID, TaskID: e.TaskID})
+			r.outbox = append(r.outbox, usecase.Message{EventID: e.ID, TaskID: e.TaskID})
 		}
 	}
 }
-func (r *repo) Insert(ctx context.Context, t *task.Task) error {
+func (r *repo) Insert(ctx context.Context, t *domain.Task) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	s := t.Snapshot()
 	if _, ok := r.tasks[s.ID]; ok {
-		return app.ErrConflict
+		return usecase.ErrConflict
 	}
 	r.tasks[s.ID] = s
 	r.record(t)
 	return nil
 }
-func (r *repo) Save(ctx context.Context, t *task.Task, version int64) error {
+func (r *repo) Save(ctx context.Context, t *domain.Task, version int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	s := t.Snapshot()
 	old, ok := r.tasks[s.ID]
 	if !ok {
-		return app.ErrNotFound
+		return usecase.ErrNotFound
 	}
 	if old.Version != version {
-		return app.ErrConflict
+		return usecase.ErrConflict
 	}
 	r.tasks[s.ID] = s
 	r.record(t)

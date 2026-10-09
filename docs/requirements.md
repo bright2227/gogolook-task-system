@@ -4,7 +4,7 @@
 
 | Requirement | Implementation | Verification | Status |
 | --- | --- | --- | --- |
-| Four lifecycle states; cancellation is final and completed cancellation conflicts | `internal/task`, HTTP API, PostgreSQL migration | `TestLifecycleCancellationAndFencedLeaseRecovery`, `TestCompletedTaskCannotBeCanceled`, `TestTaskHTTPFlowAndValidation` | VERIFIED (core only) |
+| Four lifecycle states; cancellation is final and completed cancellation conflicts | `internal/domain`, HTTP API, PostgreSQL migration | `TestLifecycleCancellationAndFencedLeaseRecovery`, `TestCompletedTaskCannotBeCanceled`, `TestTaskHTTPFlowAndValidation` | VERIFIED (core only) |
 | Submit, retrieve, and cancel through HTTP | HTTP API | `TestTaskHTTPFlowAndValidation` | VERIFIED (core only) |
 | Business failures persist as completed error outcomes; shutdown leaves a leased task recoverable | Consumer application service | `TestConsumerPersistsBusinessErrorAndLeavesInterruptedWorkRecoverable` | VERIFIED (core only) |
 | Relay releases failed publishes and marks confirmed publishes | Relay application service | `TestRelayReleasesFailedPublishAndMarksConfirmedPublish` | VERIFIED (core only) |
@@ -15,6 +15,6 @@
 | Pending cancellation prevents execution; completed cancellation returns conflict | HTTP API and task application | `TestPostgresAndRabbitMQ` PostgreSQL-backed HTTP cancellation and queued delivery phase | PENDING (container) |
 | Poison messages reach the dead-letter queue; worker shutdown requeues and lease recovery completes | RabbitMQ adapter and task application | `TestPostgresAndRabbitMQ` poison and shutdown redelivery phases | PENDING (container) |
 | Isolated real PostgreSQL and RabbitMQ integration suite | Testcontainers | `go test -tags=integration -v ./tests/integration` | PENDING (container) |
-| Long-lived deployment and load exercise | Dockerfile, Compose, `cmd/load` | `docker compose up --build --scale worker=2`; `make load` | PENDING (container) |
+| Long-lived deployment and load exercise | Dockerfile, Compose, `cmd/load` | `docker compose -f deployments/docker-compose.yml up --build --scale worker=2`; `make load` | PENDING (container) |
 | Task lifecycle glossary, architecture boundaries, and design rationale | `docs/domain.md`, `docs/architecture.md`, ADR 001 | Documentation review | VERIFIED |
 | Inward dependencies and independent HTTP input boundary | Application input ports/DTOs and HTTP presenter | `TestDependencyRule`, `TestHTTPTranslatesRequestsAndPresentsResponses`, `TestHTTPMapsApplicationErrorsAndRetainsBodyValidation` | VERIFIED (core only) |

@@ -20,9 +20,9 @@ func TestDependencyRule(t *testing.T) {
 		dir     string
 		allowed map[string]bool
 	}{
-		{"entities", "internal/task", nil},
-		{"use cases", "internal/app", map[string]bool{module + "/internal/task": true}},
-		{"HTTP boundary", "internal/adapter/httpapi", map[string]bool{module + "/internal/app": true}},
+		{"entities", "internal/domain", nil},
+		{"use cases", "internal/usecase", map[string]bool{module + "/internal/domain": true}},
+		{"HTTP boundary", "internal/delivery/http", map[string]bool{module + "/internal/usecase": true}},
 	}
 	for _, layer := range layers {
 		t.Run(layer.name, func(t *testing.T) {

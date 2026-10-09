@@ -1,5 +1,5 @@
-// Package task contains the task entity and lifecycle rules, independent of infrastructure.
-package task
+// Package domain contains the task entity and lifecycle rules, independent of infrastructure.
+package domain
 
 import (
 	"bytes"

@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/app"
-	"github.com/bright2227/vsx-task-system/internal/task"
+	"github.com/bright2227/vsx-task-system/internal/domain"
+	"github.com/bright2227/vsx-task-system/internal/usecase"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -51,48 +51,48 @@ func (c Config) normalized() Config {
 }
 
 type envelope struct {
-	EventID task.ID `json:"event_id"`
-	TaskID  task.ID `json:"task_id"`
+	EventID domain.ID `json:"event_id"`
+	TaskID  domain.ID `json:"task_id"`
 }
 
-func message(m app.Message) ([]byte, error) {
-	if _, err := task.ParseID(string(m.TaskID)); err != nil {
+func message(m usecase.Message) ([]byte, error) {
+	if _, err := domain.ParseID(string(m.TaskID)); err != nil {
 		return nil, fmt.Errorf("invalid task ID: %w", err)
 	}
 	if m.EventID != "" {
-		if _, err := task.ParseID(string(m.EventID)); err != nil {
+		if _, err := domain.ParseID(string(m.EventID)); err != nil {
 			return nil, fmt.Errorf("invalid event ID: %w", err)
 		}
 	}
 	return json.Marshal(envelope{m.EventID, m.TaskID})
 }
 
-func decode(body []byte) (app.Message, error) {
+func decode(body []byte) (usecase.Message, error) {
 	if len(body) > 1024 {
-		return app.Message{}, errors.New("task envelope exceeds 1024 bytes")
+		return usecase.Message{}, errors.New("task envelope exceeds 1024 bytes")
 	}
 	var e envelope
 	d := json.NewDecoder(bytes.NewReader(body))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&e); err != nil {
-		return app.Message{}, err
+		return usecase.Message{}, err
 	}
 	var extra any
 	if err := d.Decode(&extra); !errors.Is(err, io.EOF) {
-		return app.Message{}, errors.New("expected one JSON value")
+		return usecase.Message{}, errors.New("expected one JSON value")
 	}
-	taskID, err := task.ParseID(string(e.TaskID))
+	taskID, err := domain.ParseID(string(e.TaskID))
 	if err != nil {
-		return app.Message{}, err
+		return usecase.Message{}, err
 	}
-	eventID := task.ID("")
+	eventID := domain.ID("")
 	if e.EventID != "" {
-		eventID, err = task.ParseID(string(e.EventID))
+		eventID, err = domain.ParseID(string(e.EventID))
 		if err != nil {
-			return app.Message{}, err
+			return usecase.Message{}, err
 		}
 	}
-	return app.Message{TaskID: taskID, EventID: eventID}, nil
+	return usecase.Message{TaskID: taskID, EventID: eventID}, nil
 }
 
 type Client struct {
@@ -198,17 +198,17 @@ func (c *Client) topology(ch *amqp.Channel) error {
 
 // Publish is synchronous: it succeeds only after a broker confirm and no
 // mandatory return.
-func (c *Client) Publish(ctx context.Context, m app.Message) error {
+func (c *Client) Publish(ctx context.Context, m usecase.Message) error {
 	return c.publishTo(ctx, c.cfg.Queue, m)
 }
-func (c *Client) Retry(ctx context.Context, m app.Message) error {
+func (c *Client) Retry(ctx context.Context, m usecase.Message) error {
 	return c.publishTo(ctx, c.cfg.RetryQueue, m)
 }
 func (c *Client) DeadLetter(ctx context.Context, body []byte) error {
 	return c.publishRaw(ctx, c.cfg.DeadQueue, body)
 }
 
-func (c *Client) publishTo(ctx context.Context, queue string, m app.Message) error {
+func (c *Client) publishTo(ctx context.Context, queue string, m usecase.Message) error {
 	body, err := message(m)
 	if err != nil {
 		return err
@@ -336,7 +336,7 @@ func (pc *publishChannel) invalidate() {
 // Consume reconnects until ctx is canceled. Each channel uses bounded prefetch
 // and a fixed worker count. A failed retry/DLQ publish leaves the delivery
 // unacknowledged so closing the channel returns it to the durable source queue.
-func (c *Client) Consume(ctx context.Context, workers int, processor app.TaskProcessor) error {
+func (c *Client) Consume(ctx context.Context, workers int, processor usecase.TaskProcessor) error {
 	if workers < 1 {
 		return errors.New("worker count must be positive")
 	}
@@ -355,7 +355,7 @@ func (c *Client) Consume(ctx context.Context, workers int, processor app.TaskPro
 	return ctx.Err()
 }
 
-func (c *Client) consumeSession(ctx context.Context, workers int, processor app.TaskProcessor) error {
+func (c *Client) consumeSession(ctx context.Context, workers int, processor usecase.TaskProcessor) error {
 	conn, err := c.connection()
 	if err != nil {
 		return err
@@ -371,7 +371,7 @@ func (c *Client) consumeSession(ctx context.Context, workers int, processor app.
 	if err = ch.Qos(workers, 0, false); err != nil {
 		return err
 	}
-	consumerTag := "vsx-worker-" + string(task.NewID())
+	consumerTag := "vsx-worker-" + string(domain.NewID())
 	deliveries, err := ch.Consume(c.cfg.Queue, consumerTag, false, false, false, false, nil)
 	if err != nil {
 		return err
@@ -401,7 +401,7 @@ func (c *Client) consumeSession(ctx context.Context, workers int, processor app.
 	}
 }
 
-func (c *Client) handle(ctx context.Context, ch *amqp.Channel, d amqp.Delivery, processor app.TaskProcessor) {
+func (c *Client) handle(ctx context.Context, ch *amqp.Channel, d amqp.Delivery, processor usecase.TaskProcessor) {
 	m, err := decode(d.Body)
 	if err != nil {
 		if publishErr := c.DeadLetter(ctx, d.Body); publishErr != nil {
@@ -415,7 +415,7 @@ func (c *Client) handle(ctx context.Context, ch *amqp.Channel, d amqp.Delivery, 
 		slog.Warn("task delivery dead-lettered", "reason", "malformed", "error", err)
 		return
 	}
-	err = processor.Process(ctx, app.ProcessTaskRequest{ID: string(m.TaskID)})
+	err = processor.Process(ctx, usecase.ProcessTaskRequest{ID: string(m.TaskID)})
 	if err == nil {
 		if ackErr := d.Ack(false); ackErr != nil {
 			slog.Error("processed task delivery ack failed", "task_id", m.TaskID, "error", ackErr)
@@ -424,7 +424,7 @@ func (c *Client) handle(ctx context.Context, ch *amqp.Channel, d amqp.Delivery, 
 		slog.Info("task delivery acknowledged", "task_id", m.TaskID, "event_id", m.EventID)
 		return
 	}
-	if errors.Is(err, app.ErrNotFound) {
+	if errors.Is(err, usecase.ErrNotFound) {
 		if publishErr := c.DeadLetter(ctx, d.Body); publishErr != nil {
 			slog.Error("unknown task could not be dead-lettered", "task_id", m.TaskID, "event_id", m.EventID, "error", publishErr)
 			_ = ch.Close()

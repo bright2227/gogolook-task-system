@@ -11,11 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/app"
+	"github.com/bright2227/vsx-task-system/internal/usecase"
 )
 
 type API struct {
-	Tasks    app.TaskUseCases
+	Tasks    usecase.TaskUseCases
 	Ready    func(context.Context) error
 	requests atomic.Int64
 	failures atomic.Int64
@@ -37,19 +37,19 @@ func write(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func taskResponse(s app.TaskResponse) response {
+func taskResponse(s usecase.TaskResponse) response {
 	return response{s.ID, json.RawMessage(s.Payload), s.Status, s.Result, s.Error, s.CreatedAt, s.UpdatedAt, s.Attempts}
 }
 func (a *API) problem(w http.ResponseWriter, err error) {
 	code, message := http.StatusServiceUnavailable, "storage temporarily unavailable"
 	switch {
-	case errors.Is(err, app.ErrNotFound):
+	case errors.Is(err, usecase.ErrNotFound):
 		code, message = http.StatusNotFound, err.Error()
-	case errors.Is(err, app.ErrInvalidID):
+	case errors.Is(err, usecase.ErrInvalidID):
 		code, message = http.StatusBadRequest, err.Error()
-	case errors.Is(err, app.ErrInvalidPayload):
+	case errors.Is(err, usecase.ErrInvalidPayload):
 		code, message = http.StatusUnprocessableEntity, err.Error()
-	case errors.Is(err, app.ErrCompleted), errors.Is(err, app.ErrConflict):
+	case errors.Is(err, usecase.ErrCompleted), errors.Is(err, usecase.ErrConflict):
 		code, message = http.StatusConflict, err.Error()
 	default:
 		a.failures.Add(1)
@@ -102,7 +102,7 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 		write(w, 400, map[string]string{"error": "expected one JSON object"})
 		return
 	}
-	s, err := a.Tasks.Submit(r.Context(), app.SubmitTaskRequest{Payload: in.Payload})
+	s, err := a.Tasks.Submit(r.Context(), usecase.SubmitTaskRequest{Payload: in.Payload})
 	if err != nil {
 		a.problem(w, err)
 		return
@@ -111,7 +111,7 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusAccepted, taskResponse(s))
 }
 func (a *API) get(w http.ResponseWriter, r *http.Request) {
-	s, err := a.Tasks.Get(r.Context(), app.TaskRequest{ID: r.PathValue("id")})
+	s, err := a.Tasks.Get(r.Context(), usecase.TaskRequest{ID: r.PathValue("id")})
 	if err != nil {
 		a.problem(w, err)
 		return
@@ -125,7 +125,7 @@ func (a *API) cancel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s, err := a.Tasks.Cancel(r.Context(), app.TaskRequest{ID: strings.TrimSuffix(action, suffix)})
+	s, err := a.Tasks.Cancel(r.Context(), usecase.TaskRequest{ID: strings.TrimSuffix(action, suffix)})
 	if err != nil {
 		a.problem(w, err)
 		return

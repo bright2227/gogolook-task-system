@@ -9,15 +9,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/adapter/postgres"
-	"github.com/bright2227/vsx-task-system/internal/adapter/rabbitmq"
-	"github.com/bright2227/vsx-task-system/internal/app"
-	runtimecfg "github.com/bright2227/vsx-task-system/internal/runtime"
+	"github.com/bright2227/vsx-task-system/internal/configs"
+	"github.com/bright2227/vsx-task-system/internal/delivery/rabbitmq"
+	"github.com/bright2227/vsx-task-system/internal/repository/task/postgres"
+	"github.com/bright2227/vsx-task-system/internal/usecase"
 )
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-	cfg, err := runtimecfg.Load()
+	cfg, err := configs.Load()
 	if err != nil {
 		slog.Error("invalid configuration", "error", err)
 		os.Exit(2)
@@ -34,7 +34,7 @@ func main() {
 	defer store.Close()
 	broker := rabbitmq.New(cfg.Rabbit)
 	defer broker.Close()
-	relay := app.Relay{Outbox: store, Publisher: broker, Batch: cfg.RelayBatch}
+	relay := usecase.Relay{Outbox: store, Publisher: broker, Batch: cfg.RelayBatch}
 	ticker := time.NewTicker(cfg.RelayInterval)
 	defer ticker.Stop()
 	slog.Info("outbox relay started", "batch", cfg.RelayBatch, "interval", cfg.RelayInterval.String())

@@ -7,7 +7,7 @@ test:
 	go test ./...
 
 test-core:
-	go test -race ./internal/task ./internal/app ./internal/adapter/memory ./internal/adapter/httpapi ./internal/adapter/processor ./tests/architecture
+	go test -race ./internal/domain ./internal/usecase ./internal/repository/task/memory ./internal/delivery/http ./internal/infrastructure/processor ./tests/architecture
 
 race:
 	go test -race ./...
@@ -22,10 +22,10 @@ integration:
 	go test -tags=integration ./tests/integration -v
 
 up:
-	docker compose up --build --scale worker=2
+	docker compose -f deployments/docker-compose.yml up --build --scale worker=2
 
 down:
-	docker compose down
+	docker compose -f deployments/docker-compose.yml down
 
 load:
 	go run ./cmd/load -url http://localhost:8080 -duration 30s -concurrency 8

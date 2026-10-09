@@ -10,15 +10,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/adapter/httpapi"
-	"github.com/bright2227/vsx-task-system/internal/adapter/postgres"
-	"github.com/bright2227/vsx-task-system/internal/app"
-	runtimecfg "github.com/bright2227/vsx-task-system/internal/runtime"
+	"github.com/bright2227/vsx-task-system/internal/configs"
+	"github.com/bright2227/vsx-task-system/internal/delivery/http"
+	"github.com/bright2227/vsx-task-system/internal/repository/task/postgres"
+	"github.com/bright2227/vsx-task-system/internal/usecase"
 )
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-	cfg, err := runtimecfg.Load()
+	cfg, err := configs.Load()
 	if err != nil {
 		slog.Error("invalid configuration", "error", err)
 		os.Exit(2)
@@ -33,7 +33,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
-	api := &httpapi.API{Tasks: app.Tasks{Store: store, Clock: time.Now}, Ready: func(ctx context.Context) error { return store.DB.PingContext(ctx) }}
+	api := &httpapi.API{Tasks: usecase.Tasks{Store: store, Clock: time.Now}, Ready: func(ctx context.Context) error { return store.DB.PingContext(ctx) }}
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { slog.Info("http server listening", "addr", cfg.HTTPAddr); serveErr <- srv.ListenAndServe() }()

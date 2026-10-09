@@ -1,3 +1,5 @@
+name: vsx-task-system
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -9,7 +11,7 @@ services:
     ports: ["5432:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+      - ../internal/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U task -d tasks"]
       interval: 3s
@@ -35,7 +37,8 @@ services:
   server:
     restart: unless-stopped
     build:
-      context: .
+      context: ..
+      dockerfile: deployments/Dockerfile
       args: { SERVICE: server }
     environment:
       DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
@@ -49,7 +52,8 @@ services:
   worker:
     restart: unless-stopped
     build:
-      context: .
+      context: ..
+      dockerfile: deployments/Dockerfile
       args: { SERVICE: worker }
     environment:
       DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
@@ -63,7 +67,8 @@ services:
   relay:
     restart: unless-stopped
     build:
-      context: .
+      context: ..
+      dockerfile: deployments/Dockerfile
       args: { SERVICE: relay }
     environment:
       DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
