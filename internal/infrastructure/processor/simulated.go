@@ -4,12 +4,12 @@ import (
 	"context"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/domain"
+	"github.com/bright2227/gogolook-task-system/internal/domain"
 )
 
 type SimulatedProcessor struct{}
 
-func (SimulatedProcessor) Execute(ctx context.Context, _ domain.Payload) (string, error) {
+func (SimulatedProcessor) Execute(ctx context.Context, _ domain.ID, _ domain.Payload) (string, error) {
 	t := time.NewTimer(3 * time.Second)
 	defer t.Stop()
 	select {

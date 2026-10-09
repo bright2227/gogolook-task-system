@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/usecase"
+	"github.com/bright2227/gogolook-task-system/internal/usecase"
 )
 
 type API struct {
@@ -75,7 +75,7 @@ func (a *API) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		_, _ = io.WriteString(w, "# TYPE vsx_http_requests_total counter\nvsx_http_requests_total "+jsonNumber(a.requests.Load())+"\n# TYPE vsx_storage_failures_total counter\nvsx_storage_failures_total "+jsonNumber(a.failures.Load())+"\n")
+		_, _ = io.WriteString(w, "# TYPE gogolook_http_requests_total counter\ngogolook_http_requests_total "+jsonNumber(a.requests.Load())+"\n# TYPE gogolook_storage_failures_total counter\ngogolook_storage_failures_total "+jsonNumber(a.failures.Load())+"\n")
 	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.requests.Add(1)

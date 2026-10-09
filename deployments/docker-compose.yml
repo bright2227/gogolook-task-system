@@ -1,4 +1,4 @@
-name: vsx-task-system
+name: gogolook-task-system
 
 services:
   postgres:
@@ -11,7 +11,7 @@ services:
     ports: ["5432:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ../internal/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+      - ../internal/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U task -d tasks"]
       interval: 3s
@@ -58,6 +58,7 @@ services:
     environment:
       DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
       RABBITMQ_URL: amqp://task:task@rabbitmq:5672/
+      TASK_RETRY_DELAYS: "${TASK_RETRY_DELAYS:-1s,10s,60s}"
     depends_on:
       postgres: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }

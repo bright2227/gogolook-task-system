@@ -1,33 +1,22 @@
-# Assignment requirement mapping
+# Requirement and verification map
 
-**VERIFIED (core only)** means the named unit tests ran successfully in this workspace without external services. **PENDING (container)** means the Testcontainers case is implemented but remains uncompiled and unrun here because Go dependencies are unavailable and Docker access is denied.
+The retry, execution-fencing, attempt-history, and DLQ replay behaviors below are implemented in the current source. `make test-core` and core vet pass for the domain, use cases, memory repository, HTTP boundary, processor build, and architecture checks. Broker, configuration, and CLI unit tests remain uncompiled/unrun because they import unavailable dependencies. The Testcontainers scenarios are implemented, but the integration package has not been compiled or run in this environment: required Go modules are unavailable offline, and Docker access is blocked. Do not read an unrun integration test as a passing result.
 
-| Requirement | Implementation | Verification | Status |
+| Requirement | Implementation | Test coverage | Current verification |
 | --- | --- | --- | --- |
-| Four lifecycle states; cancellation is final and completed cancellation conflicts | `internal/domain`, HTTP API, PostgreSQL migration | `TestLifecycleCancellationAndFencedLeaseRecovery`, `TestCompletedTaskCannotBeCanceled`, `TestTaskHTTPFlowAndValidation` | VERIFIED (core only) |
-| Submit, retrieve, and cancel through HTTP | HTTP API | `TestTaskHTTPFlowAndValidation` | VERIFIED (core only) |
-| Business failures persist as completed error outcomes; shutdown leaves a leased task recoverable | Consumer application service | `TestConsumerPersistsBusinessErrorAndLeavesInterruptedWorkRecoverable` | VERIFIED (core only) |
-| Relay releases failed publishes and marks confirmed publishes | Relay application service | `TestRelayReleasesFailedPublishAndMarksConfirmedPublish` | VERIFIED (core only) |
-| Task, event, and outbox commit together or roll back together | PostgreSQL repository transaction | `TestPostgresAndRabbitMQ` submission and rollback phases | PENDING (container) |
-| Confirmed outbox publishing; broker outage releases a lease and later succeeds | Relay and RabbitMQ adapter | `TestPostgresAndRabbitMQ` broker outage/recovery phase | PENDING (container) |
-| A closed database causes queued retry; recovery completes once | RabbitMQ consumer and PostgreSQL repository | `TestPostgresAndRabbitMQ` closed-database retry phase | PENDING (container) |
-| Three-second asynchronous processor, duplicate delivery, and concurrent workers | Processor adapter and RabbitMQ consumer | `TestPostgresAndRabbitMQ` timed completion, duplicate publish, and two-job barrier phases | PENDING (container) |
-| Pending cancellation prevents execution; completed cancellation returns conflict | HTTP API and task application | `TestPostgresAndRabbitMQ` PostgreSQL-backed HTTP cancellation and queued delivery phase | PENDING (container) |
-| Poison messages reach the dead-letter queue; worker shutdown requeues and lease recovery completes | RabbitMQ adapter and task application | `TestPostgresAndRabbitMQ` poison and shutdown redelivery phases | PENDING (container) |
-| Isolated real PostgreSQL and RabbitMQ integration suite | Testcontainers | `go test -tags=integration -v ./tests/integration` | PENDING (container) |
-| Long-lived deployment and load exercise | Dockerfile, Compose, `cmd/load` | `docker compose -f deployments/docker-compose.yml up --build --scale worker=2`; `make load` | PENDING (container) |
-| Task lifecycle glossary, architecture boundaries, and design rationale | `docs/domain.md`, `docs/architecture.md`, ADR 001 | Documentation review | VERIFIED |
-| Inward dependencies and independent HTTP input boundary | Application input ports/DTOs and HTTP presenter | `TestDependencyRule`, `TestHTTPTranslatesRequestsAndPresentsResponses`, `TestHTTPMapsApplicationErrorsAndRetainsBodyValidation` | VERIFIED (core only) |
+| Four lifecycle states; cancellation clears leases and cannot overwrite completion | `internal/domain`, use cases, HTTP, PostgreSQL | `TestLifecycleCancellationAndFencedLeaseRecovery`, `TestCompletedTaskCannotBeCanceled`, `TestTaskHTTPFlowAndValidation` | PASS: core race tests |
+| Submission, retrieval, and cancellation through HTTP with transport-neutral application DTOs | `internal/delivery/http`, `internal/usecase` | `TestHTTPTranslatesRequestsAndPresentsResponses`, `TestHTTPMapsApplicationErrorsAndRetainsBodyValidation` | PASS: core race tests |
+| Retryable processor failures persist a bounded schedule; permanent and exhausted failures complete with error and enqueue DLQ delivery | `internal/usecase/tasks.go`, domain transitions, PostgreSQL and memory repositories, outbox relay | `TestRetryPersistsDelayedWorkAndDeadLettersAfterBudget`, `TestNilRetryDelaysUseDefaultOneTenSixtySeconds`, `TestWorkerTimeoutIsRetryableUnlessParentShutsDown` | PASS: core race tests |
+| Retry decision, attempt finalization, task/event update, and next outbox row commit atomically | Use-case transaction and repository transaction | `TestFailureOutboxRollbackLeavesInputUnacknowledgeable`, `TestStoreTransactionRollsBackWhenCallbackFails` | PASS: core race tests |
+| Lifetime attempts survive lease recovery and replay; stale workers/executions are fenced | Domain execution IDs and lease tokens; persistent attempt records | `TestExpiredLeaseRecoveryPreservesAttemptHistoryAndFencesLateWorker`, `TestRetryGeneratesNewExecutionAndEnforcesNotBefore`, `TestLateSuccessCannotOverwriteCancellationOrAttemptOutcome` | PASS: core race tests |
+| Permanent failure and manual replay receipt are atomic and idempotent | `Tasks.Replay`, replay receipt repository, PostgreSQL transaction | `TestPermanentFailureAndReplayReceiptAreAtomicAndIdempotent` | PASS: core race tests |
+| Business execution errors become retry/DLQ decisions; worker shutdown retains recoverable work without spending retry budget | `Consumer.Process`, processor port | `TestConsumerPersistsBusinessErrorAndLeavesInterruptedWorkRecoverable`, `TestWorkerTimeoutIsRetryableUnlessParentShutsDown` | PASS: core race tests |
+| Relay publishes outbox messages with confirm handling and releases failed publication reservations | `internal/usecase/relay.go`, RabbitMQ publisher | `TestRelayReleasesFailedPublishAndMarksConfirmedPublish` | PASS: core race tests |
+| Malformed and unknown messages are durably quarantined; known failure envelope retains IDs, counts, and diagnostics | RabbitMQ adapter and DLQ envelope parser | `TestDecodeRejectsPoisonMessages`, `TestParseFailureEnvelope` | Uncompiled/unrun: RabbitMQ dependency unavailable |
+| Worker-pod CLI inspection is bounded; replay is audited and ACKs only after database commit | `cmd/taskctl`, `rabbitmq.Client.ScanDeadLetters`, `Tasks.Replay` | `TestParseInspectCommand`, `TestParseReplayRequiresAuditAndBoundedScan` | Uncompiled/unrun: PostgreSQL/RabbitMQ dependencies unavailable; delivery behavior requires integration |
+| HTTP/domain/application dependency direction | Application ports and adapters | `TestDependencyRule`, `TestHTTPTranslatesRequestsAndPresentsResponses` | PASS: core race tests |
+| Real PostgreSQL/RabbitMQ retry, outage, stale delivery, DLQ, replay, and worker-pod CLI flow | Testcontainers suite in `tests/integration` | `TestPostgresAndRabbitMQ`, `TestRetryDLQAndWorkerCLI` | Implemented but not compiled or run here; modules unavailable offline and Docker socket inaccessible |
+| Long-lived Compose stack and load exercise | `deployments/docker-compose.yml`, Dockerfile, `cmd/load` | `docker compose -f deployments/docker-compose.yml up --build --scale worker=2`; `make load` | Not run here because Docker access is blocked |
+| CDC outbox publishing | Optional future alternative to polling relay | None | Not implemented |
 
-## Planned retry and DLQ requirements
-
-The [detailed specification](retry-and-dlq-spec.md) is the acceptance contract for these changes. Documentation is complete when the specification is reviewed; implementation and container tests remain pending.
-
-| Requirement | Status |
-| --- | --- |
-| Classify execution failures and atomically persist retry or DLQ decisions | SPECIFIED; not implemented |
-| Persist bounded retry counts and reject stale execution messages | SPECIFIED; not implemented |
-| Persist attempt diagnostics and include failure context in DLQ messages | SPECIFIED; not implemented |
-| Manual inspect/replay CLI inside the existing worker pod; no new HTTP API | SPECIFIED; not implemented |
-| Idempotent replay receipt, operator audit, and DLQ ACK after database commit | SPECIFIED; not implemented |
-| Optional CDC publisher with durable checkpoints and explicit delay handling | DESIGN OPTION; not implemented |
+The default automatic retry policy is three retries after the initial attempt, scheduled at 1 second, 10 seconds, and 60 seconds. Retry count is separate from lifetime attempts and replay cycle. PostgreSQL `available_at` controls due publication; there is no RabbitMQ TTL retry tier in the active path. Database failures and shutdown interruptions retain the original delivery and do not consume this budget.

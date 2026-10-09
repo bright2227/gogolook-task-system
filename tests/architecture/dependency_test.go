@@ -13,7 +13,7 @@ import (
 // The dependency rule is an architectural contract: business code must not
 // depend on transport, storage, messaging, or framework implementations.
 func TestDependencyRule(t *testing.T) {
-	const module = "github.com/bright2227/vsx-task-system"
+	const module = "github.com/bright2227/gogolook-task-system"
 	root := filepath.Join("..", "..")
 	layers := []struct {
 		name    string

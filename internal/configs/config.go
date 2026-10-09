@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/delivery/rabbitmq"
+	"github.com/bright2227/gogolook-task-system/internal/delivery/rabbitmq"
 )
 
 type Config struct {
@@ -18,11 +19,13 @@ type Config struct {
 	RelayInterval  time.Duration
 	ProcessTimeout time.Duration
 	Lease          time.Duration
+	RetryDelays    []time.Duration
+	WorkerID       string
 }
 
 func Load() (Config, error) {
 	c := Config{
-		DatabaseURL: env("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/vsx_tasks?sslmode=disable"),
+		DatabaseURL: env("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/gogolook_tasks?sslmode=disable"),
 		HTTPAddr:    env("HTTP_ADDR", ":8080"),
 		Rabbit: rabbitmq.Config{
 			URL:        env("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
@@ -33,6 +36,13 @@ func Load() (Config, error) {
 		Workers: 8, RelayBatch: 32, RelayInterval: time.Second, ProcessTimeout: 10 * time.Second, Lease: 30 * time.Second,
 	}
 	var err error
+	if c.RetryDelays, err = retryDelays(env("TASK_RETRY_DELAYS", "1s,10s,60s")); err != nil {
+		return c, err
+	}
+	c.WorkerID = os.Getenv("POD_NAME")
+	if c.WorkerID == "" {
+		c.WorkerID, _ = os.Hostname()
+	}
 	if c.Workers, err = intEnv("WORKERS", c.Workers); err != nil {
 		return c, err
 	}
@@ -94,4 +104,27 @@ func durationEnv(k string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", k, e)
 	}
 	return d, nil
+}
+
+// retryDelays defines execution retries; legacy RETRY_DELAY is configuration compatibility only.
+func retryDelays(raw string) ([]time.Duration, error) {
+	if strings.TrimSpace(raw) == "none" {
+		return []time.Duration{}, nil
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) > 10 {
+		return nil, fmt.Errorf("TASK_RETRY_DELAYS must contain at most 10 delays")
+	}
+	delays := make([]time.Duration, 0, len(parts))
+	for _, part := range parts {
+		delay, err := time.ParseDuration(strings.TrimSpace(part))
+		if err != nil || delay < time.Millisecond || delay > time.Hour {
+			return nil, fmt.Errorf("TASK_RETRY_DELAYS values must be durations from 1ms to 1h")
+		}
+		if len(delays) > 0 && delay < delays[len(delays)-1] {
+			return nil, fmt.Errorf("TASK_RETRY_DELAYS must be in non-decreasing order")
+		}
+		delays = append(delays, delay)
+	}
+	return delays, nil
 }

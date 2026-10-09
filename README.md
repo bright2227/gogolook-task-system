@@ -1,25 +1,25 @@
-# VSX Task System
+# Gogolook Task System
 
 A Go asynchronous task service using Clean Architecture and a four-state lifecycle: `pending`, `processing`, `completed`, and `canceled`. Delivery adapters call application-owned input interfaces with request DTOs; use cases validate inputs, apply task rules, and return response DTOs. PostgreSQL and RabbitMQ implement the application's output ports, and `cmd` packages wire concrete implementations together.
 
-The HTTP API stores a task with its submission event and outbox record in one PostgreSQL transaction. A relay publishes outbox messages to durable RabbitMQ queues with publisher confirms; workers execute each job asynchronously (the sample processor takes three seconds) and persist the terminal outcome. PostgreSQL remains the source of truth. Terminal-state checks skip completed or canceled tasks, and processing leases allow recovery after worker loss. Real processors must make external effects idempotent because execution can succeed before its result is saved.
+The HTTP API stores a task with its submission event and outbox record in one PostgreSQL transaction. A relay publishes due outbox messages to durable RabbitMQ queues with publisher confirms. Workers execute asynchronously (the sample processor takes three seconds), retry transient execution failures within a bounded budget, and send permanent or exhausted failures to the DLQ through the same transactional outbox. PostgreSQL remains the source of truth. Execution IDs and leases fence stale work. Real processors receive the stable task ID and must make external effects idempotent because execution can succeed before its result is saved.
 
 ## Retry and DLQ specification
 
 The [detailed retry and DLQ specification](docs/retry-and-dlq-spec.md) defines failure classification, bounded execution retries, durable failure records, task-state transitions, atomic outbox delivery, and manual investigation and replay.
 
-**Implementation status: specified; pending implementation.** The current code completes execution failures with an error, retries other processing errors without a limit, and dead-letters malformed or unknown-task messages. The specification describes the requested next version and includes its acceptance tests.
+The four improvements are implemented: failure classification, bounded automatic execution retries, persisted attempt/failure diagnostics, and manual DLQ inspection/replay. The default is three retries after the initial attempt, delayed by **1s, 10s, and 60s**. Set `TASK_RETRY_DELAYS` to a validated comma-separated duration list, or `none` to disable automatic retries. Database outages and worker interruption preserve the delivery without consuming this budget. Public failed-task responses use a generic error; detailed causes stay in operational records.
 
-Manual replay uses a CLI bundled in the worker image and executed inside the existing worker pod. It uses the pod's database and RabbitMQ configuration; no administration HTTP API is added. Command examples in the specification describe the planned CLI.
+Manual replay uses `/taskctl`, bundled in the worker image and executed inside the existing worker pod. It uses the pod's database and RabbitMQ configuration; no administration HTTP API is added. A replay commits an audit receipt and a new work outbox record before acknowledging the DLQ message. Repeating the same request is idempotent.
 
 Retry counts, attempt outcomes, and replay receipts belong in PostgreSQL. They must survive process restarts and commit with the task and outbox changes. Structured JSON application logs help troubleshooting. A separate log aggregation platform is optional; logs are not the source of retry decisions or replay state.
 
-The [architecture](docs/architecture.md), [current lifecycle](docs/domain.md), and [requirement mapping](docs/requirements.md) describe the existing implementation. The retry/DLQ specification records the proposed changes and optional CDC handoff.
+The [architecture](docs/architecture.md), [lifecycle](docs/domain.md), and [requirement mapping](docs/requirements.md) explain the implementation. The retry/DLQ specification records transaction boundaries, failure policies, operator commands, upgrade steps, and an optional future CDC handoff. CDC is not implemented.
 
 The layout follows the original client project's layer names:
 
 ```text
-cmd/                         # server, worker, relay, load runner
+cmd/                         # server, worker, relay, taskctl, load runner
 internal/
   configs/                   # environment configuration
   domain/                    # task entity and lifecycle rules
@@ -40,9 +40,9 @@ Repository implementations live under `repository`; their interfaces stay in `us
 
 ## Run the stack
 
-Requires Docker Compose. The stack publishes the API at `http://localhost:8080`, PostgreSQL on `5432`, and RabbitMQ on `5672` (`15672` management UI). The Compose database is initialized from the migration on its first start.
+Requires Docker Compose. The stack publishes the API at `http://localhost:8080`, PostgreSQL on `5432`, and RabbitMQ on `5672` (`15672` management UI). A fresh PostgreSQL volume runs both migrations in filename order on its first start.
 
-The migration mount runs only when PostgreSQL initializes a new data volume. To apply the initial schema to an existing empty database, run `docker compose -f deployments/docker-compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U task -d tasks < internal/migrations/001_initial.sql`. Future schema changes need new versioned migrations.
+For an existing database, stop application processes before applying migrations. Apply [20261009130909_initial.sql](internal/migrations/20261009130909_initial.sql) if the original schema is absent, then [20261009130910_retry_dlq.sql](internal/migrations/20261009130910_retry_dlq.sql). The latter backfills execution identity and active attempt records and reissues legacy outbox work for unresolved tasks. See the [upgrade procedure](docs/retry-and-dlq-spec.md#schema-and-upgrade) before reusing existing volumes or queues.
 
 ```sh
 docker compose -f deployments/docker-compose.yml up --build --scale worker=2
@@ -58,6 +58,18 @@ curl -X POST http://localhost:8080/tasks/TASK_ID:cancel
 ```
 
 Creation returns `202 Accepted`. Cancellation is idempotent while canceled; completed tasks return `409 Conflict` when cancellation is requested. A cancellation racing with execution wins if it commits first, and a worker's stale lease cannot overwrite it. Payloads must be JSON no larger than 64 KiB. See the [architecture guide](docs/architecture.md), [task lifecycle and terms](docs/domain.md), [design decision](docs/adr-001-persistence-and-delivery.md), and [requirement mapping](docs/requirements.md).
+
+## Inspect and replay the DLQ
+
+Run inside an existing worker pod:
+
+```sh
+kubectl exec POD -c worker -- /taskctl dlq inspect --limit 20
+kubectl exec POD -c worker -- /taskctl dlq replay \
+  --message-id MESSAGE_UUID --operator YOUR_NAME --reason "fixed upstream dependency"
+```
+
+For the Compose stack, use `docker compose -f deployments/docker-compose.yml exec worker /taskctl dlq inspect --limit 20`. Scans default to a 30-second deadline and are bounded to 1,000 messages; inspection preserves messages but may change queue order and redelivery flags. Malformed and unknown-task messages are inspect-only. A repair command is not provided.
 
 ## Develop and validate
 

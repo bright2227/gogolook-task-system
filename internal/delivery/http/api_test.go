@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/domain"
-	"github.com/bright2227/vsx-task-system/internal/repository/task/memory"
-	"github.com/bright2227/vsx-task-system/internal/usecase"
+	"github.com/bright2227/gogolook-task-system/internal/domain"
+	"github.com/bright2227/gogolook-task-system/internal/repository/task/memory"
+	"github.com/bright2227/gogolook-task-system/internal/usecase"
 )
 
 type fakeTasks struct {
@@ -53,7 +53,18 @@ func TestTaskHTTPFlowAndValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	completion := usecase.Consumer{Store: store, Clock: time.Now, Lease: time.Second, Timeout: time.Second, Processor: funcProcessor(func(context.Context, domain.Payload) (string, error) { return "ok", nil })}
-	if err = completion.Process(context.Background(), usecase.ProcessTaskRequest{ID: completed.ID}); err != nil {
+	task, err := store.Get(context.Background(), domain.ID(completed.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventID domain.ID
+	for _, event := range store.Events {
+		if event.TaskID == domain.ID(completed.ID) && event.Name == "TaskSubmitted" {
+			eventID = event.ID
+			break
+		}
+	}
+	if err = completion.Process(context.Background(), usecase.ProcessTaskRequest{ID: completed.ID, EventID: string(eventID), ExecutionID: string(task.Snapshot().ExecutionID)}); err != nil {
 		t.Fatal(err)
 	}
 	if got := call(http.MethodPost, "/tasks/"+completed.ID+":cancel", ""); got.Code != http.StatusConflict {
@@ -78,7 +89,7 @@ func TestTaskHTTPFlowAndValidation(t *testing.T) {
 
 type funcProcessor func(context.Context, domain.Payload) (string, error)
 
-func (f funcProcessor) Execute(ctx context.Context, p domain.Payload) (string, error) {
+func (f funcProcessor) Execute(ctx context.Context, _ domain.ID, p domain.Payload) (string, error) {
 	return f(ctx, p)
 }
 

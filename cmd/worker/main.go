@@ -9,11 +9,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/configs"
-	"github.com/bright2227/vsx-task-system/internal/delivery/rabbitmq"
-	adapterprocessor "github.com/bright2227/vsx-task-system/internal/infrastructure/processor"
-	"github.com/bright2227/vsx-task-system/internal/repository/task/postgres"
-	"github.com/bright2227/vsx-task-system/internal/usecase"
+	"github.com/bright2227/gogolook-task-system/internal/configs"
+	"github.com/bright2227/gogolook-task-system/internal/delivery/rabbitmq"
+	adapterprocessor "github.com/bright2227/gogolook-task-system/internal/infrastructure/processor"
+	"github.com/bright2227/gogolook-task-system/internal/repository/task/postgres"
+	"github.com/bright2227/gogolook-task-system/internal/usecase"
 )
 
 func main() {
@@ -35,7 +35,7 @@ func main() {
 	defer store.Close()
 	broker := rabbitmq.New(cfg.Rabbit)
 	defer broker.Close()
-	consumer := usecase.Consumer{Store: store, Clock: time.Now, Processor: adapterprocessor.SimulatedProcessor{}, Lease: cfg.Lease, Timeout: cfg.ProcessTimeout}
+	consumer := usecase.Consumer{Store: store, Clock: time.Now, Processor: adapterprocessor.SimulatedProcessor{}, Lease: cfg.Lease, Timeout: cfg.ProcessTimeout, RetryDelays: cfg.RetryDelays, WorkerID: cfg.WorkerID}
 	slog.Info("worker started", "workers", cfg.Workers)
 	err = broker.Consume(ctx, cfg.Workers, consumer)
 	if err != nil && !errors.Is(err, context.Canceled) {

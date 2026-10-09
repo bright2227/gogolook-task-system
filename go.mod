@@ -1,4 +1,4 @@
-module github.com/bright2227/vsx-task-system
+module github.com/bright2227/gogolook-task-system
 
 go 1.25.0
 

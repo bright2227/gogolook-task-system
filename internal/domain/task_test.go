@@ -80,3 +80,54 @@ func TestCompletedTaskCannotBeCanceled(t *testing.T) {
 		t.Fatal("completed task changed state")
 	}
 }
+
+func TestRetryGeneratesNewExecutionAndEnforcesNotBefore(t *testing.T) {
+	now := time.Date(2025, 4, 5, 6, 7, 8, 0, time.UTC)
+	payload, _ := NewPayload([]byte(`{}`))
+	task, err := Submit(payload, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := task.Snapshot()
+	token := NewID()
+	if ok, e := task.Start(token, now, time.Minute); e != nil || !ok {
+		t.Fatalf("start=%v err=%v", ok, e)
+	}
+	newExecution := NewID()
+	due := now.Add(10 * time.Second)
+	failure := &Failure{Category: "retryable", Code: "temporary", Detail: "private"}
+	if ok, e := task.Retry(token, newExecution, now, due, failure); e != nil || !ok {
+		t.Fatalf("retry=%v err=%v", ok, e)
+	}
+	s := task.Snapshot()
+	if s.Status != Pending || s.ExecutionID != newExecution || s.ExecutionID == initial.ExecutionID || s.RetryCount != 1 || s.Attempts != 1 || s.LeaseToken != "" || s.LeaseUntil != nil || !s.NotBefore.Equal(due) {
+		t.Fatalf("retry state=%+v", s)
+	}
+	if ok, e := task.Start(NewID(), due.Add(-time.Second), time.Minute); ok || !errors.Is(e, ErrNotDue) {
+		t.Fatalf("early Start=%v err=%v", ok, e)
+	}
+	if ok, e := task.Start(NewID(), due, time.Minute); e != nil || !ok {
+		t.Fatalf("due Start=%v err=%v", ok, e)
+	}
+}
+
+func TestEventFailureDataIsDeepCopied(t *testing.T) {
+	now := time.Now().UTC()
+	payload, _ := NewPayload([]byte(`{}`))
+	task, _ := Submit(payload, now)
+	token := NewID()
+	_, _ = task.Start(token, now, time.Second)
+	original := []byte("raw")
+	failure := &Failure{Category: "retryable", Code: "temporary", Detail: "cause", Original: original}
+	_, err := task.Retry(token, NewID(), now, now.Add(time.Second), failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original[0] = 'X'
+	events := task.Events()
+	events[len(events)-1].Failure.Original[1] = 'Y'
+	again := task.Events()
+	if string(again[len(again)-1].Failure.Original) != "raw" {
+		t.Fatalf("event failure data was shared: %q", again[len(again)-1].Failure.Original)
+	}
+}

@@ -1,4 +1,4 @@
-Source: https://github.com/bright2227/Assignment---VSX/blob/master/Assignment.md
+Original assignment text retained below.
 Source commit: 71681753761ef1a38f3d7de3f3dd0d54afb1bb8a
 
 The user's Go requirement replaces references to Python/FastAPI below.

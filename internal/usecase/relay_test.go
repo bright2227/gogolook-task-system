@@ -6,8 +6,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bright2227/vsx-task-system/internal/domain"
-	"github.com/bright2227/vsx-task-system/internal/usecase"
+	"github.com/bright2227/gogolook-task-system/internal/domain"
+	"github.com/bright2227/gogolook-task-system/internal/usecase"
 )
 
 type outboxStub struct {

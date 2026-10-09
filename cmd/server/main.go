@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/configs"
-	"github.com/bright2227/vsx-task-system/internal/delivery/http"
-	"github.com/bright2227/vsx-task-system/internal/repository/task/postgres"
-	"github.com/bright2227/vsx-task-system/internal/usecase"
+	"github.com/bright2227/gogolook-task-system/internal/configs"
+	"github.com/bright2227/gogolook-task-system/internal/delivery/http"
+	"github.com/bright2227/gogolook-task-system/internal/repository/task/postgres"
+	"github.com/bright2227/gogolook-task-system/internal/usecase"
 )
 
 func main() {

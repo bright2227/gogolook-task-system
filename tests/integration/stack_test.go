@@ -4,7 +4,9 @@ package integration
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,12 +20,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bright2227/vsx-task-system/internal/delivery/http"
-	"github.com/bright2227/vsx-task-system/internal/delivery/rabbitmq"
-	"github.com/bright2227/vsx-task-system/internal/domain"
-	processorapp "github.com/bright2227/vsx-task-system/internal/infrastructure/processor"
-	"github.com/bright2227/vsx-task-system/internal/repository/task/postgres"
-	"github.com/bright2227/vsx-task-system/internal/usecase"
+	"github.com/bright2227/gogolook-task-system/internal/delivery/http"
+	"github.com/bright2227/gogolook-task-system/internal/delivery/rabbitmq"
+	"github.com/bright2227/gogolook-task-system/internal/domain"
+	processorapp "github.com/bright2227/gogolook-task-system/internal/infrastructure/processor"
+	"github.com/bright2227/gogolook-task-system/internal/repository/task/postgres"
+	"github.com/bright2227/gogolook-task-system/internal/usecase"
 	_ "github.com/lib/pq"
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/testcontainers/testcontainers-go"
@@ -57,15 +59,25 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err = db.PingContext(ctx); err != nil {
 		t.Fatal(err)
 	}
-	migration, err := os.ReadFile(filepath.Join("..", "..", "internal", "migrations", "001_initial.sql"))
+	migrationDir := filepath.Join("..", "..", "internal", "migrations")
+	migrations, err := os.ReadDir(migrationDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.ExecContext(ctx, string(migration)); err != nil {
-		t.Fatal(err)
+	for _, entry := range migrations {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		migration, readErr := os.ReadFile(filepath.Join(migrationDir, entry.Name()))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if _, err = db.ExecContext(ctx, string(migration)); err != nil {
+			t.Fatalf("apply migration %s: %v", entry.Name(), err)
+		}
 	}
 	var tables int
-	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('tasks','task_events','outbox')`).Scan(&tables); err != nil || tables != 3 {
+	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('tasks','task_events','outbox','task_attempts','task_dead_letters','task_replay_receipts')`).Scan(&tables); err != nil || tables != 6 {
 		t.Fatalf("migration tables=%d err=%v", tables, err)
 	}
 	pgStore := &postgres.Store{DB: db}
@@ -111,8 +123,8 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	workStarted := time.Now()
 	workPhase, stopWorkPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopWorkPhase()
-	worker := startConsumer(t, ctx, client, 2, func(c context.Context, id domain.ID) error {
-		return consumer.Process(c, usecase.ProcessTaskRequest{ID: string(id)})
+	worker := startConsumer(t, ctx, client, 2, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		return consumer.Process(c, req)
 	})
 	deadline := time.NewTicker(20 * time.Millisecond)
 	defer deadline.Stop()
@@ -159,8 +171,8 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	parallelPhase, stopParallelPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopParallelPhase()
 	parallelConsumer := usecase.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: barrier}
-	parallel := startConsumer(t, ctx, client, 2, func(c context.Context, id domain.ID) error {
-		return parallelConsumer.Process(c, usecase.ProcessTaskRequest{ID: string(id)})
+	parallel := startConsumer(t, ctx, client, 2, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		return parallelConsumer.Process(c, req)
 	})
 	for i := 0; i < 2; i++ {
 		select {
@@ -194,12 +206,13 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 		t.Fatalf("parallel worker stop: %v", err)
 	}
 	// A broker-level duplicate delivery after completion remains a no-op.
-	if err = client.Publish(ctx, usecase.Message{EventID: domain.NewID(), TaskID: domain.ID(created.ID)}); err != nil {
+	duplicateRequest := currentProcessRequest(ctx, t, pgStore, db, domain.ID(created.ID))
+	if err = client.Publish(ctx, usecase.Message{EventID: domain.ID(duplicateRequest.EventID), TaskID: domain.ID(duplicateRequest.ID), ExecutionID: domain.ID(duplicateRequest.ExecutionID), Destination: usecase.DestinationWork}); err != nil {
 		t.Fatal(err)
 	}
 	duplicateSeen := make(chan struct{}, 1)
-	duplicateWorker := startConsumer(t, ctx, client, 1, func(c context.Context, id domain.ID) error {
-		err := consumer.Process(c, usecase.ProcessTaskRequest{ID: string(id)})
+	duplicateWorker := startConsumer(t, ctx, client, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		err := consumer.Process(c, req)
 		duplicateSeen <- struct{}{}
 		return err
 	})
@@ -247,8 +260,11 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(unblock)
 	cancelConsumer := usecase.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: blockingProcessor{started, release}}
+	cancelRequest := currentProcessRequest(ctx, t, pgStore, db, domain.ID(cancelTask.ID))
 	procDone := make(chan error, 1)
-	go func() { procDone <- cancelConsumer.Process(ctx, usecase.ProcessTaskRequest{ID: string(cancelTask.ID)}) }()
+	go func() {
+		procDone <- cancelConsumer.Process(ctx, cancelRequest)
+	}()
 	select {
 	case <-started:
 	case <-ctx.Done():
@@ -286,7 +302,7 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 		}
 		return baseTime.Add(60*time.Millisecond + time.Duration(n-1)*time.Millisecond)
 	}
-	leaseProcessor := integrationProcessorFunc(func(context.Context, domain.Payload) (string, error) {
+	leaseProcessor := integrationProcessorFunc(func(context.Context, domain.ID, domain.Payload) (string, error) {
 		execMu.Lock()
 		executions++
 		n := executions
@@ -299,15 +315,16 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 		return "new owner", nil
 	})
 	firstConsumer := usecase.Consumer{Store: pgStore, Clock: leaseClock, Lease: 60 * time.Millisecond, Timeout: time.Second, Processor: leaseProcessor}
+	firstRequest := currentProcessRequest(ctx, t, pgStore, db, domain.ID(leaseTask.ID))
 	firstDone := make(chan error, 1)
-	go func() { firstDone <- firstConsumer.Process(ctx, usecase.ProcessTaskRequest{ID: string(leaseTask.ID)}) }()
+	go func() { firstDone <- firstConsumer.Process(ctx, firstRequest) }()
 	select {
 	case <-firstStarted:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
 	secondConsumer := usecase.Consumer{Store: pgStore, Clock: leaseClock, Lease: time.Second, Timeout: time.Second, Processor: leaseProcessor}
-	if err = secondConsumer.Process(ctx, usecase.ProcessTaskRequest{ID: string(leaseTask.ID)}); err != nil {
+	if err = secondConsumer.Process(ctx, currentProcessRequest(ctx, t, pgStore, db, domain.ID(leaseTask.ID))); err != nil {
 		allowStaleFinish()
 		t.Fatal(err)
 	}
@@ -333,7 +350,9 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err = ch.Publish("", "integration.tasks", false, false, amqp091.Publishing{ContentType: "application/json", Body: []byte(`{"task_id":`)}); err != nil {
 		t.Fatal(err)
 	}
-	poisonWorker := startConsumer(t, ctx, client, 1, func(context.Context, domain.ID) error { return errors.New("poison handler must not run") })
+	poisonWorker := startConsumer(t, ctx, client, 1, func(context.Context, usecase.ProcessTaskRequest) error {
+		return errors.New("poison handler must not run")
+	})
 	poisonPhase, stopPoisonPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopPoisonPhase()
 	for {
@@ -351,6 +370,72 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	}
 	if err = poisonWorker.Stop(); err != nil {
 		t.Fatalf("poison consumer stop: %v", err)
+	}
+	var quarantine rabbitmq.FailureEnvelope
+	scan, scanErr := client.ScanDeadLetters(ctx, 10, "", func(item rabbitmq.DeadLetterItem) error {
+		var parseErr error
+		quarantine, parseErr = rabbitmq.ParseFailureEnvelope(item.Body)
+		return parseErr
+	})
+	if scanErr != nil || scan.Scanned != 1 || quarantine.Failure.Category != "malformed_envelope" || string(quarantine.Failure.Original) != `{"task_id":` {
+		t.Fatalf("malformed envelope quarantine scan=%+v failure=%+v err=%v", scan, quarantine.Failure, scanErr)
+	}
+	poisonHash := sha256.Sum256([]byte(`{"task_id":`))
+	if quarantine.Failure.OriginalHash != hex.EncodeToString(poisonHash[:]) || quarantine.Failure.OriginalTruncated {
+		t.Fatalf("malformed envelope capture hash/truncation=%s/%t", quarantine.Failure.OriginalHash, quarantine.Failure.OriginalTruncated)
+	}
+	unknownDelivery := usecase.Message{EventID: domain.NewID(), TaskID: domain.NewID(), ExecutionID: domain.NewID(), Destination: usecase.DestinationWork}
+	unknownEnvelope, err := json.Marshal(struct {
+		Version     int       `json:"version"`
+		EventID     domain.ID `json:"event_id"`
+		TaskID      domain.ID `json:"task_id"`
+		ExecutionID domain.ID `json:"execution_id"`
+	}{1, unknownDelivery.EventID, unknownDelivery.TaskID, unknownDelivery.ExecutionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = client.Publish(ctx, unknownDelivery); err != nil {
+		t.Fatal(err)
+	}
+	unknownWorker := startConsumer(t, ctx, client, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		return consumer.Process(c, req)
+	})
+	unknownPhase, stopUnknownPhase := context.WithTimeout(ctx, 20*time.Second)
+	defer stopUnknownPhase()
+	for {
+		info, inspectErr := ch.QueueInspect("integration.dead")
+		if inspectErr == nil && info.Messages >= 2 {
+			break
+		}
+		select {
+		case <-time.After(25 * time.Millisecond):
+		case <-unknownPhase.Done():
+			t.Fatal(unknownPhase.Err())
+		case <-unknownWorker.done:
+			t.Fatalf("unknown-task worker exited: %v", unknownWorker.err)
+		}
+	}
+	if err = unknownWorker.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	var malformedFound, unknownFound bool
+	scan, scanErr = client.ScanDeadLetters(ctx, 10, "", func(item rabbitmq.DeadLetterItem) error {
+		failure, parseErr := rabbitmq.ParseFailureEnvelope(item.Body)
+		if parseErr != nil {
+			return parseErr
+		}
+		switch failure.Failure.Category {
+		case "malformed_envelope":
+			malformedFound = string(failure.Failure.Original) == `{"task_id":`
+		case "unknown_task":
+			unknownFound = string(failure.Failure.Original) == string(unknownEnvelope)
+			unknownHash := sha256.Sum256(unknownEnvelope)
+			unknownFound = unknownFound && failure.Failure.OriginalHash == hex.EncodeToString(unknownHash[:]) && !failure.Failure.OriginalTruncated
+		}
+		return nil
+	})
+	if scanErr != nil || scan.Scanned != 2 || !malformedFound || !unknownFound {
+		t.Fatalf("quarantine captures scan=%+v malformed=%t unknown=%t err=%v", scan, malformedFound, unknownFound, scanErr)
 	}
 
 	api := &httpapi.API{Tasks: usecase.Tasks{Store: pgStore, Clock: time.Now}, Ready: func(ctx context.Context) error { return db.PingContext(ctx) }}
@@ -389,8 +474,8 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 		return resp
 	}
 	completedHTTP := submitHTTP()
-	instant := usecase.Consumer{Store: pgStore, Clock: time.Now, Lease: time.Second, Timeout: time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.Payload) (string, error) { return "complete", nil })}
-	if err = instant.Process(ctx, usecase.ProcessTaskRequest{ID: string(completedHTTP)}); err != nil {
+	instant := usecase.Consumer{Store: pgStore, Clock: time.Now, Lease: time.Second, Timeout: time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.ID, domain.Payload) (string, error) { return "complete", nil })}
+	if err = instant.Process(ctx, currentProcessRequest(ctx, t, pgStore, db, completedHTTP)); err != nil {
 		t.Fatal(err)
 	}
 	response := cancelHTTP(completedHTTP)
@@ -412,8 +497,8 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	seen := make(chan struct{}, count)
 	apiPhase, stopAPIPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopAPIPhase()
-	apiWorker := startConsumer(t, ctx, apiClient, 2, func(c context.Context, id domain.ID) error {
-		err := instant.Process(c, usecase.ProcessTaskRequest{ID: string(id)})
+	apiWorker := startConsumer(t, ctx, apiClient, 2, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		err := instant.Process(c, req)
 		seen <- struct{}{}
 		return err
 	})
@@ -459,11 +544,11 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	closedStore := &postgres.Store{DB: closedDB}
 	observedClosedStore := &signalStore{inner: closedStore, failed: make(chan struct{}, 1)}
 	switchable := &switchStore{current: observedClosedStore}
-	retryConsumer := usecase.Consumer{Store: switchable, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.Payload) (string, error) { return "recovered", nil })}
+	retryConsumer := usecase.Consumer{Store: switchable, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.ID, domain.Payload) (string, error) { return "recovered", nil })}
 	seenFailure := make(chan domain.ID, 1)
-	retryWorker := startConsumer(t, ctx, retryClient, 1, func(c context.Context, id domain.ID) error {
-		seenFailure <- id
-		return retryConsumer.Process(c, usecase.ProcessTaskRequest{ID: string(id)})
+	retryWorker := startConsumer(t, ctx, retryClient, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		seenFailure <- domain.ID(req.ID)
+		return retryConsumer.Process(c, req)
 	})
 	retryPhase, stopRetryPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopRetryPhase()
@@ -521,8 +606,8 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	if err != nil || count != 1 {
 		t.Fatalf("recovered relay count=%d err=%v", count, err)
 	}
-	recoveryWorker := startConsumer(t, ctx, failureClient, 1, func(c context.Context, id domain.ID) error {
-		return consumer.Process(c, usecase.ProcessTaskRequest{ID: string(id)})
+	recoveryWorker := startConsumer(t, ctx, failureClient, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		return consumer.Process(c, req)
 	})
 	recoveredFailure := waitForStatus(t, ctx, usecase.Tasks{Store: pgStore, Clock: time.Now}, domain.ID(failureTask.ID), domain.Completed)
 	if recoveredFailure.Attempts != 1 || recoveredFailure.Result == nil || *recoveredFailure.Result != "processed" {
@@ -549,13 +634,13 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	}
 	firstTime := time.Now().UTC()
 	firstStarted := make(chan struct{}, 1)
-	shutdownConsumer := usecase.Consumer{Store: pgStore, Clock: func() time.Time { return firstTime }, Lease: 100 * time.Millisecond, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(c context.Context, _ domain.Payload) (string, error) {
+	shutdownConsumer := usecase.Consumer{Store: pgStore, Clock: func() time.Time { return firstTime }, Lease: 100 * time.Millisecond, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(c context.Context, _ domain.ID, _ domain.Payload) (string, error) {
 		firstStarted <- struct{}{}
 		<-c.Done()
 		return "", c.Err()
 	})}
-	shutdownWorker := startConsumer(t, ctx, shutdownClient, 1, func(c context.Context, id domain.ID) error {
-		return shutdownConsumer.Process(c, usecase.ProcessTaskRequest{ID: string(id)})
+	shutdownWorker := startConsumer(t, ctx, shutdownClient, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		return shutdownConsumer.Process(c, req)
 	})
 	shutdownPhase, stopShutdownPhase := context.WithTimeout(ctx, 30*time.Second)
 	defer stopShutdownPhase()
@@ -578,9 +663,9 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	}
 	replacementClient := queueClient(host, port.Port(), "integration.shutdown")
 	t.Cleanup(func() { _ = replacementClient.Close() })
-	replacementConsumer := usecase.Consumer{Store: pgStore, Clock: func() time.Time { return firstTime.Add(101 * time.Millisecond) }, Lease: time.Second, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.Payload) (string, error) { return "replacement", nil })}
-	replacementWorker := startConsumer(t, ctx, replacementClient, 1, func(c context.Context, id domain.ID) error {
-		return replacementConsumer.Process(c, usecase.ProcessTaskRequest{ID: string(id)})
+	replacementConsumer := usecase.Consumer{Store: pgStore, Clock: func() time.Time { return firstTime.Add(101 * time.Millisecond) }, Lease: time.Second, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.ID, domain.Payload) (string, error) { return "replacement", nil })}
+	replacementWorker := startConsumer(t, ctx, replacementClient, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
+		return replacementConsumer.Process(c, req)
 	})
 	restarted := waitForStatus(t, ctx, usecase.Tasks{Store: pgStore, Clock: time.Now}, domain.ID(shutdownTask.ID), domain.Completed)
 	if restarted.Attempts != 2 || restarted.Result == nil || *restarted.Result != "replacement" {
@@ -599,10 +684,10 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 	}
 }
 
-type integrationProcessorFunc func(context.Context, domain.Payload) (string, error)
+type integrationProcessorFunc func(context.Context, domain.ID, domain.Payload) (string, error)
 
-func (f integrationProcessorFunc) Execute(ctx context.Context, p domain.Payload) (string, error) {
-	return f(ctx, p)
+func (f integrationProcessorFunc) Execute(ctx context.Context, id domain.ID, p domain.Payload) (string, error) {
+	return f(ctx, id, p)
 }
 
 func queueClient(host, port, prefix string) *rabbitmq.Client {
@@ -621,11 +706,11 @@ type runningConsumer struct {
 	err      error
 }
 
-func startConsumer(t *testing.T, parent context.Context, client *rabbitmq.Client, workers int, handler func(context.Context, domain.ID) error) *runningConsumer {
+func startConsumer(t *testing.T, parent context.Context, client *rabbitmq.Client, workers int, handler func(context.Context, usecase.ProcessTaskRequest) error) *runningConsumer {
 	t.Helper()
 	ctx, cancel := context.WithCancel(parent)
 	r := &runningConsumer{cancel: cancel, done: make(chan struct{})}
-	processor := usecase.TaskProcessorFunc(func(c context.Context, req usecase.ProcessTaskRequest) error { return handler(c, domain.ID(req.ID)) })
+	processor := usecase.TaskProcessorFunc(handler)
 	go func() { r.err = client.Consume(ctx, workers, processor); close(r.done) }()
 	t.Cleanup(func() { _ = r.Stop() })
 	return r
@@ -655,6 +740,21 @@ func waitForStatus(t *testing.T, parent context.Context, tasks usecase.Tasks, id
 			t.Fatalf("task %s did not reach %s (last status %s): %v", id, want, state.Status, ctx.Err())
 		}
 	}
+}
+
+// Direct consumer calls in this stack test still carry the same delivery identity
+// that RabbitMQ would provide: the current execution generation and its work event.
+func currentProcessRequest(ctx context.Context, t *testing.T, store usecase.Store, db *sql.DB, id domain.ID) usecase.ProcessTaskRequest {
+	t.Helper()
+	task, err := store.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventID domain.ID
+	if err = db.QueryRowContext(ctx, `SELECT event_id FROM outbox WHERE task_id=$1 AND destination='work' ORDER BY available_at DESC,event_id DESC LIMIT 1`, id).Scan(&eventID); err != nil {
+		t.Fatal(err)
+	}
+	return usecase.ProcessTaskRequest{ID: string(id), EventID: string(eventID), ExecutionID: string(task.Snapshot().ExecutionID)}
 }
 
 type signalStore struct {
@@ -711,7 +811,7 @@ type barrierProcessor struct {
 	release chan struct{}
 }
 
-func (p *barrierProcessor) Execute(ctx context.Context, _ domain.Payload) (string, error) {
+func (p *barrierProcessor) Execute(ctx context.Context, _ domain.ID, _ domain.Payload) (string, error) {
 	p.started <- struct{}{}
 	select {
 	case <-ctx.Done():
@@ -721,7 +821,7 @@ func (p *barrierProcessor) Execute(ctx context.Context, _ domain.Payload) (strin
 	}
 }
 
-func (p blockingProcessor) Execute(context.Context, domain.Payload) (string, error) {
+func (p blockingProcessor) Execute(context.Context, domain.ID, domain.Payload) (string, error) {
 	close(p.started)
 	<-p.release
 	return "late", nil
