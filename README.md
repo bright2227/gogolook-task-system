@@ -2,7 +2,19 @@
 
 A Go asynchronous task service using Clean Architecture and a four-state lifecycle: `pending`, `processing`, `completed`, and `canceled`. Delivery adapters call application-owned input interfaces with request DTOs; use cases validate inputs, apply task rules, and return response DTOs. PostgreSQL and RabbitMQ implement the application's output ports, and `cmd` packages wire concrete implementations together.
 
-The HTTP API stores a task with its submission event and outbox record in one PostgreSQL transaction. A relay publishes outbox messages to durable RabbitMQ queues with publisher confirms; workers execute each job asynchronously (the sample processor takes three seconds) and persist the terminal outcome. PostgreSQL remains the source of truth, so duplicate messages are safe and processing leases allow recovery after worker loss.
+The HTTP API stores a task with its submission event and outbox record in one PostgreSQL transaction. A relay publishes outbox messages to durable RabbitMQ queues with publisher confirms; workers execute each job asynchronously (the sample processor takes three seconds) and persist the terminal outcome. PostgreSQL remains the source of truth. Terminal-state checks skip completed or canceled tasks, and processing leases allow recovery after worker loss. Real processors must make external effects idempotent because execution can succeed before its result is saved.
+
+## Retry and DLQ specification
+
+The [detailed retry and DLQ specification](docs/retry-and-dlq-spec.md) defines failure classification, bounded execution retries, durable failure records, task-state transitions, atomic outbox delivery, and manual investigation and replay.
+
+**Implementation status: specified; pending implementation.** The current code completes execution failures with an error, retries other processing errors without a limit, and dead-letters malformed or unknown-task messages. The specification describes the requested next version and includes its acceptance tests.
+
+Manual replay uses a CLI bundled in the worker image and executed inside the existing worker pod. It uses the pod's database and RabbitMQ configuration; no administration HTTP API is added. Command examples in the specification describe the planned CLI.
+
+Retry counts, attempt outcomes, and replay receipts belong in PostgreSQL. They must survive process restarts and commit with the task and outbox changes. Structured JSON application logs help troubleshooting. A separate log aggregation platform is optional; logs are not the source of retry decisions or replay state.
+
+The [architecture](docs/architecture.md), [current lifecycle](docs/domain.md), and [requirement mapping](docs/requirements.md) describe the existing implementation. The retry/DLQ specification records the proposed changes and optional CDC handoff.
 
 The layout follows the original client project's layer names:
 

@@ -18,3 +18,16 @@
 | Long-lived deployment and load exercise | Dockerfile, Compose, `cmd/load` | `docker compose -f deployments/docker-compose.yml up --build --scale worker=2`; `make load` | PENDING (container) |
 | Task lifecycle glossary, architecture boundaries, and design rationale | `docs/domain.md`, `docs/architecture.md`, ADR 001 | Documentation review | VERIFIED |
 | Inward dependencies and independent HTTP input boundary | Application input ports/DTOs and HTTP presenter | `TestDependencyRule`, `TestHTTPTranslatesRequestsAndPresentsResponses`, `TestHTTPMapsApplicationErrorsAndRetainsBodyValidation` | VERIFIED (core only) |
+
+## Planned retry and DLQ requirements
+
+The [detailed specification](retry-and-dlq-spec.md) is the acceptance contract for these changes. Documentation is complete when the specification is reviewed; implementation and container tests remain pending.
+
+| Requirement | Status |
+| --- | --- |
+| Classify execution failures and atomically persist retry or DLQ decisions | SPECIFIED; not implemented |
+| Persist bounded retry counts and reject stale execution messages | SPECIFIED; not implemented |
+| Persist attempt diagnostics and include failure context in DLQ messages | SPECIFIED; not implemented |
+| Manual inspect/replay CLI inside the existing worker pod; no new HTTP API | SPECIFIED; not implemented |
+| Idempotent replay receipt, operator audit, and DLQ ACK after database commit | SPECIFIED; not implemented |
+| Optional CDC publisher with durable checkpoints and explicit delay handling | DESIGN OPTION; not implemented |

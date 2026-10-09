@@ -1,5 +1,7 @@
 # Clean Architecture
 
+This document describes the current implementation. The [retry and DLQ specification](retry-and-dlq-spec.md) defines the planned bounded retries and manual replay workflow; those changes remain pending implementation.
+
 The package layout follows the original client's `domain`, `usecase`, `delivery`, `repository`, and `configs` conventions. Task execution adds an `infrastructure/processor` implementation. SQL migrations live in `internal/migrations`, and container files live in `deployments`.
 
 Use cases form the boundary between delivery and task rules: HTTP depends on use-case interfaces and request/response DTOs, while the domain remains independent of delivery and infrastructure. Storage interfaces belong to `usecase`; PostgreSQL and memory implementations live in `repository/task`.
@@ -98,7 +100,7 @@ The use-case `TaskResponse` is a separate projection for callers. It deliberatel
 
 On submission, HTTP decodes the payload and calls the use case. The application validates the JSON payload, creates a pending task, then inserts the task, its `TaskSubmitted` event, and its outbox record in one transaction. The API responds with `202 Accepted` only after that transaction succeeds.
 
-The relay reserves outbox messages, publishes them with RabbitMQ publisher confirms, and marks confirmed messages. If publishing or marking fails, it releases the reservation for retry. A crash after broker confirmation but before the database mark can produce a duplicate; worker processing checks current task state and lease, making repeated delivery safe.
+The relay reserves outbox messages, publishes them with RabbitMQ publisher confirms, and marks confirmed messages. If publishing or marking fails, it releases the reservation for retry. A crash after broker confirmation but before the database mark can produce a duplicate; worker processing checks current task state and lease, protecting task state on repeated delivery. External processor effects still require idempotency.
 
 The RabbitMQ adapter validates the message envelope and calls `TaskProcessor`. The application claims the task with a lease before running the processor. A duplicate message for a completed task does not rerun work. On worker shutdown, interrupted work is redelivered and can be reclaimed after its lease expires. Malformed envelopes and unknown task IDs are dead-lettered; transient storage or broker failures use delayed retry. The sample processor waits three seconds, and business execution failures are stored as completed error outcomes.
 

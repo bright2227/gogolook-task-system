@@ -1,5 +1,7 @@
 # Task lifecycle and terms
 
+This document describes the current implementation. The [retry and DLQ specification](retry-and-dlq-spec.md) defines the planned bounded retries and manual replay workflow; those changes remain pending implementation.
+
 ## Lifecycle rules
 
 Tasks are independent work requests. Submission creates a `pending` task. A worker may claim it as `processing`, increasing its attempt count and receiving a time-limited lease. A matching lease holder can finish it as `completed` with exactly one result or error. An expired lease can be reclaimed with a new token; the new token prevents the former worker from overwriting the newer attempt.
@@ -23,4 +25,4 @@ The domain package owns lifecycle state and transition rules. It uses only the G
 
 `domain.Snapshot` is the storage adapter's persistence projection. It includes fields needed to restore and safely update state, including version and lease data. It is not the response exposed to use cases or HTTP clients. The application maps snapshots to `usecase.TaskResponse`, which contains the task ID, payload, status, outcome, timestamps, and attempt count, without the persistence version, lease token, or event history.
 
-PostgreSQL is the source of truth for task status. RabbitMQ provides at-least-once transport, so duplicate delivery is expected and safe. Worker execution and state changes are separate: a consumer claims the task, performs work, and commits the outcome under the current lease.
+PostgreSQL is the source of truth for task status. RabbitMQ provides at-least-once transport, so duplicate delivery is expected. Terminal-state checks and lease tokens protect task state; external effects require processor-level idempotency. Worker execution and state changes are separate: a consumer claims the task, performs work, and commits the outcome under the current lease.
