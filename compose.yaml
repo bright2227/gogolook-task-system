@@ -1,0 +1,77 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: task
+      POSTGRES_PASSWORD: task
+      POSTGRES_DB: tasks
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U task -d tasks"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: task
+      RABBITMQ_DEFAULT_PASS: task
+    ports: ["5672:5672", "15672:15672"]
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  server:
+    restart: unless-stopped
+    build:
+      context: .
+      args: { SERVICE: server }
+    environment:
+      DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
+      RABBITMQ_URL: amqp://task:task@rabbitmq:5672/
+      HTTP_ADDR: :8080
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  worker:
+    restart: unless-stopped
+    build:
+      context: .
+      args: { SERVICE: worker }
+    environment:
+      DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
+      RABBITMQ_URL: amqp://task:task@rabbitmq:5672/
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    deploy:
+      replicas: 2
+
+  relay:
+    restart: unless-stopped
+    build:
+      context: .
+      args: { SERVICE: relay }
+    environment:
+      DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
+      RABBITMQ_URL: amqp://task:task@rabbitmq:5672/
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  rabbitdata:
