@@ -1,12 +1,19 @@
 # Assignment requirement mapping
 
-| Requirement | Implementation | Verification |
-| --- | --- | --- |
-| Four persisted statuses and cancellation rules | `internal/task`, PostgreSQL migration, HTTP API | `internal/task` and HTTP API tests |
-| Asynchronous three-second work | sample runtime processor and worker | Compose stack and load runner |
-| Concurrent workers, duplicate delivery, crash recovery | RabbitMQ consumer, transactionally claimed leases | app/domain tests; integration suite |
-| Task, event, and outbox atomicity | PostgreSQL repository transaction | Testcontainers integration suite |
-| Confirmed publishing and poison-message handling | RabbitMQ adapter and relay | Testcontainers integration suite |
-| Isolated real database and broker tests | build-tagged Testcontainers suite | `go test -tags=integration ./tests/integration` |
-| Long-lived deployment and throughput exercise | Dockerfile, Compose, `cmd/load` | `docker compose up --build --scale worker=2`; `make load` |
-| Domain glossary, context map, rationale | `docs/domain.md`, ADR 001 | Documentation review |
+**VERIFIED (core only)** means the named unit tests ran successfully in this workspace without external services. **PENDING (container)** means the Testcontainers case is implemented but remains uncompiled and unrun here because Go dependencies are unavailable and Docker access is denied.
+
+| Requirement | Implementation | Verification | Status |
+| --- | --- | --- | --- |
+| Four lifecycle states; cancellation is final and completed cancellation conflicts | `internal/task`, HTTP API, PostgreSQL migration | `TestLifecycleCancellationAndFencedLeaseRecovery`, `TestCompletedTaskCannotBeCanceled`, `TestTaskHTTPFlowAndValidation` | VERIFIED (core only) |
+| Submit, retrieve, and cancel through HTTP | HTTP API | `TestTaskHTTPFlowAndValidation` | VERIFIED (core only) |
+| Business failures persist as completed error outcomes; shutdown leaves a leased task recoverable | Consumer application service | `TestConsumerPersistsBusinessErrorAndLeavesInterruptedWorkRecoverable` | VERIFIED (core only) |
+| Relay releases failed publishes and marks confirmed publishes | Relay application service | `TestRelayReleasesFailedPublishAndMarksConfirmedPublish` | VERIFIED (core only) |
+| Task, event, and outbox commit together or roll back together | PostgreSQL repository transaction | `TestPostgresAndRabbitMQ` submission and rollback phases | PENDING (container) |
+| Confirmed outbox publishing; broker outage releases a lease and later succeeds | Relay and RabbitMQ adapter | `TestPostgresAndRabbitMQ` broker outage/recovery phase | PENDING (container) |
+| A closed database causes queued retry; recovery completes once | RabbitMQ consumer and PostgreSQL repository | `TestPostgresAndRabbitMQ` closed-database retry phase | PENDING (container) |
+| Three-second asynchronous processor, duplicate delivery, and concurrent workers | Runtime processor and RabbitMQ consumer | `TestPostgresAndRabbitMQ` timed completion, duplicate publish, and two-job barrier phases | PENDING (container) |
+| Pending cancellation prevents execution; completed cancellation returns conflict | HTTP API and task application | `TestPostgresAndRabbitMQ` PostgreSQL-backed HTTP cancellation and queued delivery phase | PENDING (container) |
+| Poison messages reach the dead-letter queue; worker shutdown requeues and lease recovery completes | RabbitMQ adapter and task application | `TestPostgresAndRabbitMQ` poison and shutdown redelivery phases | PENDING (container) |
+| Isolated real PostgreSQL and RabbitMQ integration suite | Testcontainers | `go test -tags=integration -v ./tests/integration` | PENDING (container) |
+| Long-lived deployment and load exercise | Dockerfile, Compose, `cmd/load` | `docker compose up --build --scale worker=2`; `make load` | PENDING (container) |
+| Domain glossary, context map, and design rationale | `docs/domain.md`, ADR 001 | Documentation review | VERIFIED |

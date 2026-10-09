@@ -60,8 +60,8 @@ func Load() (Config, error) {
 	if c.RelayInterval <= 0 {
 		return c, fmt.Errorf("RELAY_INTERVAL must be positive")
 	}
-	if c.Rabbit.RetryDelay <= 0 || c.Rabbit.RetryDelay.Milliseconds() > 2147483647 {
-		return c, fmt.Errorf("RETRY_DELAY must be positive and fit in 32-bit milliseconds")
+	if c.Rabbit.RetryDelay < time.Millisecond || c.Rabbit.RetryDelay.Milliseconds() > 2147483647 {
+		return c, fmt.Errorf("RETRY_DELAY must be at least 1ms and fit in 32-bit milliseconds")
 	}
 	c.Rabbit.DialTimeout = 3 * time.Second
 	return c, nil

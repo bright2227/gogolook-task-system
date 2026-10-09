@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bright2227/vsx-task-system/internal/task"
 )
@@ -41,6 +42,25 @@ func TestDecodeRejectsPoisonMessages(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			if _, err := decode([]byte(body)); err == nil {
 				t.Fatal("decode accepted malformed message")
+			}
+		})
+	}
+}
+
+func TestRetryDelayNormalizationBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{name: "sub-millisecond defaults", in: time.Nanosecond, want: 2 * time.Second},
+		{name: "minimum accepted", in: time.Millisecond, want: time.Millisecond},
+		{name: "maximum accepted", in: time.Duration(2147483647) * time.Millisecond, want: time.Duration(2147483647) * time.Millisecond},
+		{name: "above int32 milliseconds defaults", in: time.Duration(2147483648) * time.Millisecond, want: 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (Config{RetryDelay: tc.in}).normalized().RetryDelay; got != tc.want {
+				t.Fatalf("normalized delay = %s, want %s", got, tc.want)
 			}
 		})
 	}

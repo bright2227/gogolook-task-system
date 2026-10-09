@@ -41,7 +41,7 @@ func (c Config) normalized() Config {
 	if c.DeadQueue == "" {
 		c.DeadQueue = DefaultDeadQueue
 	}
-	if c.RetryDelay <= 0 || c.RetryDelay.Milliseconds() > 2147483647 {
+	if c.RetryDelay < time.Millisecond || c.RetryDelay.Milliseconds() > 2147483647 {
 		c.RetryDelay = 2 * time.Second
 	}
 	if c.DialTimeout <= 0 {
