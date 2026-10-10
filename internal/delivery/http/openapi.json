@@ -1,0 +1,548 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Gogolook Task API",
+    "version": "1.0.0",
+    "description": "Create, inspect, list, edit and delete asynchronous string tasks. Task status is 0 for incomplete and 1 for completed work. Content versions and running claims guard mutations."
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "Current server"
+    }
+  ],
+  "paths": {
+    "/tasks": {
+      "post": {
+        "operationId": "submitTask",
+        "summary": "Submit a task",
+        "description": "Persists a pending task with is_submitted=false. The sweeper later publishes its ID and records is_submitted=true after broker confirmation.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitTask"
+              },
+              "example": {
+                "name": "example",
+                "payload": "hello world"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pending task persisted",
+            "headers": {
+              "Location": {
+                "description": "URL of the created task",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "description": "Quoted task content version, usable as If-Match for PUT or DELETE.",
+                "schema": {
+                  "type": "string",
+                  "example": "\"1\""
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "get": {
+        "operationId": "listTasks",
+        "summary": "List tasks",
+        "description": "Returns tasks ordered by creation time and task ID, both descending. Use the returned cursor to fetch the next page. Offset and limit pagination are not supported.",
+        "parameters": [
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "description": "Number of tasks to return.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque URL-safe base64 cursor returned as next_cursor. It encodes the last item's RFC3339Nano created_time timestamp, a pipe, and its task ID.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of tasks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/tasks/{id}": {
+      "get": {
+        "operationId": "getTask",
+        "summary": "Get a task",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TaskID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Task details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "description": "Quoted task content version, usable as If-Match for PUT or DELETE.",
+                "schema": {
+                  "type": "string",
+                  "example": "\"1\""
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateTask",
+        "summary": "Edit task name and payload",
+        "description": "Rejects running tasks. Changed content increments version once; identical content is a no-op. Name-only edits preserve execution state/outcomes. A changed payload resets pending/unsubmitted work, clears outcomes and retry state, and makes it due now. ID and creation time are preserved.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TaskID"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTask"
+              },
+              "example": {
+                "name": "edited",
+                "payload": "new task text"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated task with its current content version",
+            "headers": {
+              "ETag": {
+                "description": "Quoted task content version, usable as If-Match for PUT or DELETE.",
+                "schema": {
+                  "type": "string",
+                  "example": "\"1\""
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTask",
+        "summary": "Delete a task",
+        "description": "Hard-deletes a nonrunning task and its retained historical dependents. Queued IDs are skipped and acknowledged when consumed.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TaskID"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Task deleted; response has no body"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "operationId": "live",
+        "summary": "Liveness check",
+        "responses": {
+          "200": {
+            "description": "Process is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "operationId": "ready",
+        "summary": "Readiness check",
+        "responses": {
+          "200": {
+            "description": "Storage is ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics",
+        "summary": "Prometheus metrics",
+        "responses": {
+          "200": {
+            "description": "HTTP request and storage failure counters",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "TaskID": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Task UUID.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "IfMatch": {
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "description": "One quoted positive content version, such as \"1\". Stale versions return 409. Without the header the request checks the version it reads internally. Wildcards, weak tags and lists are not accepted.",
+        "schema": {
+          "type": "string",
+          "example": "\"1\""
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid page size or cursor, or unsupported offset/limit parameters",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "UnprocessableEntity": {
+        "description": "Missing or invalid string fields, malformed JSON, or invalid If-Match header",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Task does not exist or the task ID is invalid",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Task is running or the expected content version is stale",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "Database or message queue operation failed",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "SubmitTask": {
+        "type": "object",
+        "required": [
+          "payload"
+        ],
+        "properties": {
+          "payload": {
+            "type": "string",
+            "description": "Original task text, including an empty string; at most 1024 UTF-8 bytes, no NUL characters.",
+            "example": "hello world"
+          },
+          "name": {
+            "type": "string",
+            "default": "",
+            "description": "Optional task name; empty strings are allowed; at most 256 UTF-8 bytes, no NUL characters."
+          },
+          "status": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ],
+            "description": "Accepted for compatibility with the assignment and ignored; the server derives status from processing."
+          }
+        }
+      },
+      "Task": {
+        "type": "object",
+        "required": [
+          "id",
+          "payload",
+          "status",
+          "result",
+          "error",
+          "is_submitted",
+          "created_time",
+          "updated_time",
+          "name",
+          "version",
+          "is_running"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "payload": {
+            "type": "string",
+            "description": "Original task text, including an empty string; at most 1024 UTF-8 bytes, no NUL characters.",
+            "example": "hello world"
+          },
+          "status": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ],
+            "description": "0 means incomplete (pending or processing work); 1 means completed, including completion with an error. is_running identifies active execution."
+          },
+          "result": {
+            "type": "string",
+            "nullable": true
+          },
+          "error": {
+            "type": "string",
+            "nullable": true,
+            "description": "Task execution error, or null."
+          },
+          "created_time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "is_submitted": {
+            "type": "boolean",
+            "description": "True after the task ID has been successfully published."
+          },
+          "name": {
+            "type": "string",
+            "description": "Task name; defaults to an empty string; at most 256 UTF-8 bytes."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "readOnly": true,
+            "description": "Whole-row revision, initially 1. Edits and lifecycle transitions (claim, finish, retry, release, recovery) increment it; the publication marker does not."
+          },
+          "is_running": {
+            "type": "boolean",
+            "readOnly": true,
+            "description": "True while a consumer owns the current execution claim. PUT and DELETE reject this state."
+          }
+        }
+      },
+      "TaskList": {
+        "type": "object",
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Task"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "nullable": true,
+            "description": "Cursor for the next page, or null when there are no more results."
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          }
+        }
+      },
+      "UpdateTask": {
+        "type": "object",
+        "required": [
+          "name",
+          "payload"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Task name; empty strings are allowed; at most 256 UTF-8 bytes, no NUL characters."
+          },
+          "payload": {
+            "type": "string",
+            "description": "Original task text; empty and non-JSON strings are allowed; at most 1024 UTF-8 bytes, no NUL characters."
+          },
+          "status": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ],
+            "description": "Accepted for compatibility with the assignment and ignored; the server derives status from processing."
+          }
+        }
+      }
+    }
+  }
+}

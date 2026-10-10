@@ -3,6 +3,9 @@ name: gogolook-task-system
 services:
   postgres:
     image: postgres:16-alpine
+    cpus: 0.5
+    mem_limit: 128m
+    command: ["postgres", "-c", "shared_buffers=16MB", "-c", "max_connections=32", "-c", "work_mem=1MB", "-c", "maintenance_work_mem=16MB"]
     restart: unless-stopped
     environment:
       POSTGRES_USER: task
@@ -11,7 +14,6 @@ services:
     ports: ["5432:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ../internal/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U task -d tasks"]
       interval: 3s
@@ -19,43 +21,57 @@ services:
       retries: 20
 
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
+    image: rabbitmq:3.13-alpine
+    cpus: 0.5
+    mem_limit: 256m
     hostname: rabbitmq
     restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: task
       RABBITMQ_DEFAULT_PASS: task
-    ports: ["5672:5672", "15672:15672"]
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 1:1 +SDcpu 1 +SDio 1 +A 4"
+      RABBITMQ_CTL_ERL_ARGS: "+S 1:1 +SDcpu 1 +SDio 1 +A 2"
+    ports: ["5672:5672"]
     volumes:
       - rabbitdata:/var/lib/rabbitmq
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/30-limits.conf:ro
+      - ./enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      # Early probes must not create a root-owned Erlang cookie.
+      test: ["CMD", "su-exec", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
       timeout: 5s
       retries: 20
 
   server:
+    cpus: 0.5
+    mem_limit: 96m
     restart: unless-stopped
     build:
       context: ..
       dockerfile: deployments/Dockerfile
       args: { SERVICE: server }
     environment:
+      GOMEMLIMIT: 64MiB
       DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
-      RABBITMQ_URL: amqp://task:task@rabbitmq:5672/
       HTTP_ADDR: :8080
+      RABBITMQ_URL: amqp://task:task@rabbitmq:5672/
     ports: ["8080:8080"]
+    # The server dials RabbitMQ lazily; until the broker is up, new tasks are
+    # left to the sweeper.
     depends_on:
       postgres: { condition: service_healthy }
-      rabbitmq: { condition: service_healthy }
 
-  worker:
+  consumer:
+    cpus: 0.5
+    mem_limit: 96m
     restart: unless-stopped
     build:
       context: ..
       dockerfile: deployments/Dockerfile
-      args: { SERVICE: worker }
+      args: { SERVICE: consumer }
     environment:
+      GOMEMLIMIT: 64MiB
       DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
       RABBITMQ_URL: amqp://task:task@rabbitmq:5672/
       TASK_RETRY_DELAYS: "${TASK_RETRY_DELAYS:-1s,10s,60s}"
@@ -63,17 +79,23 @@ services:
       postgres: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
     deploy:
-      replicas: 2
+      # Consumers may scale out: CONSUMER_REPLICAS=3 or `up --scale consumer=3`.
+      replicas: ${CONSUMER_REPLICAS:-1}
 
-  relay:
+  sweeper:
+    cpus: 0.5
+    mem_limit: 64m
     restart: unless-stopped
     build:
       context: ..
       dockerfile: deployments/Dockerfile
-      args: { SERVICE: relay }
+      args: { SERVICE: sweeper }
     environment:
+      GOMEMLIMIT: 48MiB
       DATABASE_URL: postgres://task:task@postgres:5432/tasks?sslmode=disable
       RABBITMQ_URL: amqp://task:task@rabbitmq:5672/
+      # Stale releases spend the consumers' retry budget: keep both in step.
+      TASK_RETRY_DELAYS: "${TASK_RETRY_DELAYS:-1s,10s,60s}"
     depends_on:
       postgres: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }

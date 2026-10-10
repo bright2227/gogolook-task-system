@@ -1,24 +1,15 @@
-// Package domain contains the task entity and lifecycle rules, independent of infrastructure.
+// Package domain contains task lifecycle rules, independent of infrastructure.
 package domain
 
 import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
-)
-
-var (
-	ErrPayload       = errors.New("payload must be valid JSON of at most 65536 bytes")
-	ErrCompleted     = errors.New("completed tasks cannot be canceled")
-	ErrBusy          = errors.New("task execution lease is still held")
-	ErrNotDue        = errors.New("task execution is not due")
-	ErrNotReplayable = errors.New("task is not a completed failure")
 )
 
 type ID string
@@ -33,33 +24,33 @@ func NewID() ID {
 	s := hex.EncodeToString(b[:])
 	return ID(s[:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:])
 }
-
 func ParseID(s string) (ID, error) {
 	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
-		return "", errors.New("invalid task ID")
+		return "", ErrInvalidID
 	}
 	raw := s[:8] + s[9:13] + s[14:18] + s[19:23] + s[24:]
 	if _, err := hex.DecodeString(raw); err != nil {
-		return "", errors.New("invalid task ID")
+		return "", ErrInvalidID
 	}
 	return ID(strings.ToLower(s)), nil
 }
 
-// Payload is immutable. JSON returns a copy, so callers cannot alter it.
-type Payload struct{ encoded string }
+type Payload struct {
+	encoded string
+	valid   bool
+}
+
+// MaxPayloadBytes bounds a payload's UTF-8 encoding.
+const MaxPayloadBytes = 1024
 
 func NewPayload(raw []byte) (Payload, error) {
-	if len(raw) > 65536 || !utf8.Valid(raw) || !json.Valid(raw) {
+	// PostgreSQL text cannot store NUL, so it is rejected like in names.
+	if len(raw) > MaxPayloadBytes || !utf8.Valid(raw) || bytes.IndexByte(raw, 0) >= 0 {
 		return Payload{}, ErrPayload
 	}
-	var compact bytes.Buffer
-	if err := json.Compact(&compact, raw); err != nil {
-		return Payload{}, ErrPayload
-	}
-	return Payload{compact.String()}, nil
+	return Payload{encoded: string(raw), valid: true}, nil
 }
-func (p Payload) JSON() json.RawMessage { return json.RawMessage(p.encoded) }
-func (p Payload) String() string        { return p.encoded }
+func (p Payload) String() string { return p.encoded }
 
 type Status string
 
@@ -67,262 +58,243 @@ const (
 	Pending    Status = "pending"
 	Processing Status = "processing"
 	Completed  Status = "completed"
-	Canceled   Status = "canceled"
 )
 
-type Event struct {
-	ID          ID
-	TaskID      ID
-	ExecutionID ID
-	Version     int64
-	Name        string
-	OccurredAt  time.Time
-	AvailableAt time.Time
-	Failure     *Failure
-}
-
-type Failure struct {
-	Category, Code, Detail, WorkerID string
-	Original                         []byte
-	OriginalHash                     string
-	OriginalTruncated                bool
-}
-
-// Snapshot is the explicit persistence contract, not a writable domain entity.
-type Snapshot struct {
+// Task tracks editable content and the current execution claim.
+type Task struct {
 	ID                   ID
+	Name                 string
 	Payload              Payload
+	Version              int64
+	IsRunning            bool
 	Status               Status
 	CreatedAt, UpdatedAt time.Time
-	Version              int64
-	Attempts             int
 	Result, Error        *string
-	LeaseToken           ID
-	LeaseUntil           *time.Time
-	ExecutionID          ID
-	RetryCount           int
-	ReplayCycle          int
-	NotBefore            time.Time
-}
-
-type Task struct {
-	state  Snapshot
-	events []Event
+	IsSubmitted          bool
+	// RetryCount counts executions that ended without an outcome: network
+	// failures, per-task deadlines and interrupted (stale) claims share it.
+	RetryCount int
+	NextRetry  time.Time
 }
 
 func Submit(payload Payload, now time.Time) (*Task, error) {
-	if payload.encoded == "" {
+	if !payload.valid {
 		return nil, ErrPayload
 	}
 	if now.IsZero() {
 		return nil, errors.New("submission time is required")
 	}
-	t := &Task{state: Snapshot{ID: NewID(), Payload: payload, Status: Pending, CreatedAt: now.UTC(), UpdatedAt: now.UTC(), ExecutionID: NewID(), NotBefore: now.UTC()}}
-	t.record("TaskSubmitted")
-	return t, nil
+	now = taskTime(now)
+	return &Task{ID: NewID(), Payload: payload, Version: 1, Status: Pending, CreatedAt: now, UpdatedAt: now, NextRetry: now}, nil
 }
 
-func Restore(s Snapshot) (*Task, error) {
+// PostgreSQL persists microseconds. Truncating before persistence keeps due
+// times from rounding into the future and gives every repository the same keys.
+func taskTime(t time.Time) time.Time { return t.UTC().Truncate(time.Microsecond) }
+
+// MaxNameBytes bounds a name's UTF-8 encoding.
+const MaxNameBytes = 256
+
+func validName(name string) bool {
+	return len(name) <= MaxNameBytes && utf8.ValidString(name) && !strings.ContainsRune(name, '\x00')
+}
+
+// Restore validates and detaches a persisted task, including nullable values.
+func Restore(s Task) (*Task, error) {
 	if _, err := ParseID(string(s.ID)); err != nil {
 		return nil, err
 	}
-	if s.ExecutionID == "" {
-		s.ExecutionID = s.ID
-	} // The retry migration backfills existing rows to this legacy generation.
-	if s.Payload.encoded == "" || s.CreatedAt.IsZero() || s.UpdatedAt.Before(s.CreatedAt) || s.Version < 0 || s.Attempts < 0 || s.RetryCount < 0 || s.ReplayCycle < 0 {
-		return nil, errors.New("invalid task snapshot")
+	if !validName(s.Name) {
+		return nil, ErrName
+	}
+	if !s.Payload.valid || s.Version < 1 || s.CreatedAt.IsZero() || s.UpdatedAt.Before(s.CreatedAt) || s.RetryCount < 0 {
+		return nil, errors.New("invalid task")
 	}
 	switch s.Status {
-	case Pending, Processing, Completed, Canceled:
+	case Pending, Processing, Completed:
 	default:
 		return nil, fmt.Errorf("invalid task status: %s", s.Status)
 	}
-	if s.Status == Processing {
-		if s.LeaseToken == "" || s.LeaseUntil == nil || s.ExecutionID == "" {
-			return nil, errors.New("processing requires a lease")
-		}
-		if _, err := ParseID(string(s.LeaseToken)); err != nil {
-			return nil, err
-		}
-	} else if s.LeaseToken != "" || s.LeaseUntil != nil {
-		return nil, errors.New("only processing tasks hold leases")
+	if s.IsRunning != (s.Status == Processing) || (s.Status == Completed) != (s.Result != nil || s.Error != nil) {
+		return nil, errors.New("invalid task state")
 	}
-	if s.Status == Completed {
-		if (s.Result == nil) == (s.Error == nil) {
-			return nil, errors.New("completed requires exactly one outcome")
-		}
-	} else if s.Result != nil || s.Error != nil {
-		return nil, errors.New("nonterminal task has an outcome")
-	}
-	if _, err := ParseID(string(s.ExecutionID)); err != nil {
-		return nil, err
-	}
-	return &Task{state: clone(s)}, nil
-}
-
-func clone(s Snapshot) Snapshot {
+	s.CreatedAt = taskTime(s.CreatedAt)
+	s.UpdatedAt = taskTime(s.UpdatedAt)
+	s.NextRetry = taskTime(s.NextRetry)
 	if s.Result != nil {
-		v := *s.Result
-		s.Result = &v
+		value := *s.Result
+		s.Result = &value
 	}
 	if s.Error != nil {
-		v := *s.Error
-		s.Error = &v
+		value := *s.Error
+		s.Error = &value
 	}
-	if s.LeaseUntil != nil {
-		v := *s.LeaseUntil
-		s.LeaseUntil = &v
-	}
-	return s
-}
-func (t *Task) Snapshot() Snapshot { return clone(t.state) }
-func (t *Task) Events() []Event {
-	copy := append([]Event(nil), t.events...)
-	for i := range copy {
-		copy[i].Failure = cloneFailure(copy[i].Failure)
-	}
-	return copy
-}
-func (t *Task) record(name string) {
-	t.events = append(t.events, Event{ID: NewID(), TaskID: t.state.ID, ExecutionID: t.state.ExecutionID, Version: t.state.Version, Name: name, OccurredAt: t.state.UpdatedAt, AvailableAt: t.state.NotBefore})
-}
-func (t *Task) changed(name string, now time.Time) {
-	if now.Before(t.state.UpdatedAt) {
-		now = t.state.UpdatedAt
-	}
-	t.state.UpdatedAt = now.UTC()
-	t.state.Version++
-	t.record(name)
+	return &s, nil
 }
 
-func (t *Task) Cancel(now time.Time) (bool, error) {
-	if t.state.Status == Completed {
-		return false, ErrCompleted
-	}
-	if t.state.Status == Canceled {
-		return false, nil
-	}
-	t.state.Status = Canceled
-	t.state.LeaseToken = ""
-	t.state.LeaseUntil = nil
-	t.changed("TaskCanceled", now)
-	return true, nil
+// revise records a change visible to API clients: Version is the whole-row
+// revision used for ETags and every optimistic-concurrency check.
+func (t *Task) revise(now time.Time) {
+	t.Version++
+	t.changed(now)
 }
 
-// Start grants a new fenced lease. Expired execution can be reclaimed.
-func (t *Task) Start(token ID, now time.Time, duration time.Duration) (bool, error) {
-	if t.state.Status == Canceled || t.state.Status == Completed {
-		return false, nil
+func (t *Task) changed(now time.Time) {
+	now = taskTime(now)
+	if now.Before(t.UpdatedAt) {
+		now = t.UpdatedAt
 	}
-	if duration <= 0 || now.IsZero() {
-		return false, errors.New("invalid execution lease")
-	}
-	if t.state.Status == Pending && !t.state.NotBefore.IsZero() && now.Before(t.state.NotBefore) {
-		return false, ErrNotDue
-	}
-	if _, err := ParseID(string(token)); err != nil {
-		return false, err
-	}
-	if now.Before(t.state.UpdatedAt) {
-		now = t.state.UpdatedAt
-	}
-	if t.state.Status == Processing && t.state.LeaseUntil.After(now) {
+	t.UpdatedAt = now
+}
+
+func (t *Task) Edit(name string, payload Payload, now time.Time) (bool, error) {
+	if t.IsRunning {
 		return false, ErrBusy
 	}
-	until := now.Add(duration).UTC()
-	t.state.Status = Processing
-	t.state.LeaseToken = token
-	t.state.LeaseUntil = &until
-	t.state.Attempts++
-	t.changed("TaskStarted", now)
+	if !validName(name) {
+		return false, ErrName
+	}
+	if !payload.valid {
+		return false, ErrPayload
+	}
+	payloadChanged := payload != t.Payload
+	if name == t.Name && !payloadChanged {
+		return false, nil
+	}
+	if now.IsZero() {
+		return false, errors.New("edit time is required")
+	}
+	t.Name, t.Payload = name, payload
+	if payloadChanged {
+		t.Status = Pending
+		t.IsSubmitted = false
+		t.Result, t.Error = nil, nil
+		t.RetryCount = 0
+		t.NextRetry = taskTime(now)
+	}
+	t.revise(now)
 	return true, nil
 }
 
-// Finish cannot overwrite cancellation or a newer owner's result.
-func (t *Task) Finish(token ID, now time.Time, result, failure *string) (bool, error) {
-	if t.state.Status != Processing || t.state.LeaseToken != token {
+// Finished reports that a final outcome is recorded and no automatic
+// transition will change it.
+func (t *Task) Finished() bool { return t.Status == Completed }
+
+// Start atomically claims pending work.
+// A claim proves the message was published, so it also marks the task submitted.
+func (t *Task) Start(now time.Time) (bool, error) {
+	if t.Status != Pending || t.IsRunning {
+		return false, nil
+	}
+	if now.Before(t.NextRetry) {
+		return false, ErrNotDue
+	}
+	t.Status = Processing
+	t.IsRunning = true
+	t.IsSubmitted = true
+	t.revise(now)
+	return true, nil
+}
+
+func (t *Task) Finish(now time.Time, result, failure *string) (bool, error) {
+	if t.Status != Processing || !t.IsRunning {
 		return false, nil
 	}
 	if (result == nil) == (failure == nil) {
 		return false, errors.New("provide exactly one outcome")
 	}
-	t.state.Status = Completed
-	if result != nil {
-		v := *result
-		t.state.Result = &v
-	}
-	if failure != nil {
-		v := *failure
-		t.state.Error = &v
-	}
-	t.state.LeaseToken = ""
-	t.state.LeaseUntil = nil
-	t.changed("TaskCompleted", now)
+	t.Status = Completed
+	t.IsRunning = false
+	t.Result, t.Error = result, failure
+	t.revise(now)
 	return true, nil
 }
 
-// Retry releases the current lease and creates a fenced execution generation.
-func (t *Task) Retry(token, executionID ID, now, notBefore time.Time, failure *Failure) (bool, error) {
-	if t.state.Status != Processing || t.state.LeaseToken != token {
+func (t *Task) Retry(now, nextRetry time.Time) (bool, error) {
+	if t.Status != Processing || !t.IsRunning {
 		return false, nil
 	}
-	if now.IsZero() || notBefore.IsZero() {
-		return false, errors.New("retry times are required")
+	if now.IsZero() || nextRetry.Before(now) {
+		return false, errors.New("invalid retry time")
 	}
-	if _, err := ParseID(string(executionID)); err != nil {
-		return false, err
-	}
-	t.state.Status, t.state.LeaseToken, t.state.LeaseUntil = Pending, "", nil
-	t.state.ExecutionID = executionID
-	t.state.RetryCount++
-	t.state.NotBefore = notBefore.UTC()
-	t.state.Result, t.state.Error = nil, nil
-	t.changed("TaskRetryScheduled", now)
-	t.events[len(t.events)-1].Failure = cloneFailure(failure)
-	t.events[len(t.events)-1].AvailableAt = notBefore.UTC()
+	t.Status = Pending
+	t.IsRunning = false
+	t.IsSubmitted = false
+	t.RetryCount++
+	t.NextRetry = taskTime(nextRetry)
+	t.Result, t.Error = nil, nil
+	t.revise(now)
 	return true, nil
 }
 
-// Fail terminally completes the current execution with an error and DLQ event.
-func (t *Task) Fail(token ID, now time.Time, failure *Failure) (bool, error) {
-	if t.state.Status != Processing || t.state.LeaseToken != token {
-		return false, nil
+// Release returns a claim interrupted by graceful shutdown to due, unsubmitted
+// pending work without spending any budget, so the sweeper republishes it.
+func (t *Task) Release(now time.Time) bool {
+	if t.Status != Processing || !t.IsRunning {
+		return false
 	}
-	if now.IsZero() || failure == nil {
-		return false, errors.New("failure and time are required")
-	}
-	detail := "task execution failed"
-	t.state.Status, t.state.LeaseToken, t.state.LeaseUntil = Completed, "", nil
-	t.state.Result, t.state.Error = nil, &detail
-	t.changed("TaskDeadLettered", now)
-	t.events[len(t.events)-1].Failure = cloneFailure(failure)
-	return true, nil
+	t.Status = Pending
+	t.IsRunning = false
+	t.IsSubmitted = false
+	t.NextRetry = taskTime(now)
+	t.revise(now)
+	return true
 }
 
-// Replay starts a new replay cycle for a terminal failed execution.
-func (t *Task) Replay(executionID ID, now time.Time) error {
-	if t.state.Status != Completed || t.state.Error == nil || t.state.Result != nil {
-		return ErrNotReplayable
+// Interrupt releases a claim whose holder is gone: the sweeper found it stale.
+// The interrupted execution spends the same retry budget as a network failure:
+// within len(retryDelays) the task returns to unsubmitted pending work due
+// after retryDelays[RetryCount]; past it the task completes as abandoned. It
+// does nothing and returns false when the task is not running.
+func (t *Task) Interrupt(now time.Time, retryDelays []time.Duration) (abandoned bool) {
+	if t.Status != Processing || !t.IsRunning {
+		return false
 	}
-	if now.IsZero() {
-		return errors.New("replay time is required")
+	t.IsRunning = false
+	if t.RetryCount < len(retryDelays) {
+		t.Status = Pending
+		t.IsSubmitted = false
+		t.NextRetry = taskTime(now.Add(retryDelays[t.RetryCount]))
+		t.RetryCount++
+	} else {
+		failure := fmt.Sprintf("abandoned after %d attempts; the last execution was interrupted", t.RetryCount+1)
+		t.Status, t.Error = Completed, &failure
+		abandoned = true
 	}
-	if _, err := ParseID(string(executionID)); err != nil {
-		return err
-	}
-	t.state.Status, t.state.Error, t.state.Result = Pending, nil, nil
-	t.state.ExecutionID, t.state.RetryCount, t.state.NotBefore = executionID, 0, now.UTC()
-	t.state.ReplayCycle++
-	t.changed("TaskReplayed", now)
-	t.events[len(t.events)-1].AvailableAt = now.UTC()
-	return nil
+	t.revise(now)
+	return abandoned
 }
 
-func cloneFailure(f *Failure) *Failure {
-	if f == nil {
-		return nil
+// MarkSubmitted records a confirmed publication. Callers update through the
+// listed Version, so any claim, retry or edit since listing is a conflict.
+// It always refreshes UpdatedAt, so a republished message is not swept again
+// before RepublishAfter. It keeps Version: publication must not invalidate a
+// client's ETag.
+func (t *Task) MarkSubmitted(now time.Time) {
+	t.IsSubmitted = true
+	t.changed(now)
+}
+
+// Postpone backs off a task whose publication the broker rejected, so it does
+// not take the first sweep slots again before until. Callers update through the
+// listed Version. For an unsubmitted task it moves NextRetry to until; a
+// submitted task (a republication) already backs off for RepublishAfter through
+// UpdatedAt, and its NextRetry stays so a surviving message is not early. Like
+// MarkSubmitted it refreshes UpdatedAt and keeps Version.
+func (t *Task) Postpone(now, until time.Time) {
+	if !t.IsSubmitted {
+		t.NextRetry = taskTime(until)
 	}
-	c := *f
-	c.Original = append([]byte(nil), f.Original...)
-	return &c
+	t.changed(now)
+}
+
+// Unsubmit hands a task back to the sweeper: a message arrived before the task
+// was due (clock skew, or an old copy after a Retry) and is being ACKed, so the
+// sweeper must publish again when due. It bumps Version even when the task is
+// already unsubmitted: a publication marker for that message, written later
+// through the listed Version, then conflicts and is skipped instead of marking
+// the task submitted with no message left.
+func (t *Task) Unsubmit(now time.Time) {
+	t.IsSubmitted = false
+	t.revise(now)
 }

@@ -1,0 +1,39 @@
+# Dedicated warm fixtures for running one named integration test at a time.
+# All application databases are created/dropped per test. No persistent volumes.
+services:
+  postgres:
+    image: postgres:16-alpine
+    cpus: 1
+    mem_limit: 192m
+    environment:
+      POSTGRES_USER: task
+      POSTGRES_PASSWORD: task
+      POSTGRES_DB: tasks
+    command: ["postgres", "-c", "shared_buffers=16MB", "-c", "max_connections=32", "-c", "work_mem=1MB", "-c", "maintenance_work_mem=16MB"]
+    tmpfs: ["/var/lib/postgresql/data:size=96m"]
+    ports: ["127.0.0.1:15432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "task", "-d", "tasks"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  rabbitmq:
+    image: rabbitmq:3.13-alpine
+    cpus: 1
+    mem_limit: 256m
+    environment:
+      RABBITMQ_DEFAULT_USER: task
+      RABBITMQ_DEFAULT_PASS: task
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 1:1 +SDcpu 1 +SDio 1 +A 4"
+      RABBITMQ_CTL_ERL_ARGS: "+S 1:1 +SDcpu 1 +SDio 1 +A 2"
+    volumes:
+      - ./rabbitmq-test.conf:/etc/rabbitmq/conf.d/30-limits.conf:ro
+      - ./enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    tmpfs: ["/var/lib/rabbitmq:size=64m"]
+    ports: ["127.0.0.1:15672:5672"]
+    healthcheck:
+      # Early probes must not create a root-owned Erlang cookie.
+      test: ["CMD", "su-exec", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20

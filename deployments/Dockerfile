@@ -1,13 +1,12 @@
 FROM golang:1.25-alpine AS build
+ENV GOTOOLCHAIN=local
 WORKDIR /src
 COPY . .
-RUN go mod tidy
+RUN go mod download
 ARG SERVICE=server
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/service ./cmd/${SERVICE}
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/taskctl ./cmd/taskctl
+RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags='-s -w' -o /out/service ./cmd/${SERVICE}
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/service /service
-COPY --from=build /out/taskctl /taskctl
 USER nonroot:nonroot
 ENTRYPOINT ["/service"]

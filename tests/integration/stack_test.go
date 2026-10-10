@@ -4,340 +4,67 @@ package integration
 
 import (
 	"context"
-	"crypto/sha256"
-	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/bright2227/gogolook-task-system/internal/delivery/http"
-	"github.com/bright2227/gogolook-task-system/internal/delivery/rabbitmq"
+	httpapi "github.com/bright2227/gogolook-task-system/internal/delivery/http"
 	"github.com/bright2227/gogolook-task-system/internal/domain"
-	processorapp "github.com/bright2227/gogolook-task-system/internal/infrastructure/processor"
-	"github.com/bright2227/gogolook-task-system/internal/repository/task/postgres"
 	"github.com/bright2227/gogolook-task-system/internal/usecase"
-	_ "github.com/lib/pq"
-	"github.com/rabbitmq/amqp091-go"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-func TestPostgresAndRabbitMQ(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	pg, err := testcontainers.Run(ctx, "postgres:16-alpine",
-		testcontainers.WithEnv(map[string]string{"POSTGRES_USER": "task", "POSTGRES_PASSWORD": "task", "POSTGRES_DB": "tasks"}),
-		testcontainers.WithExposedPorts("5432/tcp"), testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(time.Minute), wait.ForListeningPort("5432/tcp")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = testcontainers.TerminateContainer(pg) })
-	pgHost, err := pg.Host(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pgPort, err := pg.MappedPort(ctx, "5432/tcp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	databaseURL := fmt.Sprintf("postgres://task:task@%s:%s/tasks?sslmode=disable", pgHost, pgPort.Port())
-	db, err := sql.Open("postgres", databaseURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	if err = db.PingContext(ctx); err != nil {
-		t.Fatal(err)
-	}
-	migrationDir := filepath.Join("..", "..", "internal", "migrations")
-	migrations, err := os.ReadDir(migrationDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range migrations {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
-			continue
+func TestHTTPAndBatchProcessing(t *testing.T) {
+	s := newIntegrationStack(t)
+	client := s.client(t, "integration.source")
+	svc := newPublishingTaskUseCase(s, client, 8)
+	execute := usecase.Delay(time.Millisecond)
+	server := httptest.NewServer(httpapi.NewServer(svc, func(ctx context.Context) error { return s.db.PingContext(ctx) }))
+	defer server.Close()
+	var ids []domain.ID
+	for _, text := range []string{"", "plain non-JSON", "你好🙂", strings.Repeat("a", 1024)} {
+		encoded, _ := json.Marshal(map[string]string{"name": "source task", "payload": text})
+		resp, err := http.Post(server.URL+"/tasks", "application/json", strings.NewReader(string(encoded)))
+		if err != nil {
+			t.Fatal(err)
 		}
-		migration, readErr := os.ReadFile(filepath.Join(migrationDir, entry.Name()))
-		if readErr != nil {
-			t.Fatal(readErr)
+		var dto struct {
+			ID          domain.ID `json:"id"`
+			Payload     string    `json:"payload"`
+			Name        string    `json:"name"`
+			Version     int64     `json:"version"`
+			IsRunning   bool      `json:"is_running"`
+			Status      int       `json:"status"`
+			IsSubmitted bool      `json:"is_submitted"`
+			Created     time.Time `json:"created_time"`
+			Updated     time.Time `json:"updated_time"`
 		}
-		if _, err = db.ExecContext(ctx, string(migration)); err != nil {
-			t.Fatalf("apply migration %s: %v", entry.Name(), err)
+		err = json.NewDecoder(resp.Body).Decode(&dto)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 || dto.Name != "source task" || dto.Version != 1 || dto.IsRunning || dto.Payload != text || dto.Status != 0 || !dto.IsSubmitted || dto.Created.IsZero() || dto.Updated.IsZero() {
+			t.Fatalf("source response=%+v status=%d err=%v", dto, resp.StatusCode, err)
 		}
+		ids = append(ids, dto.ID)
 	}
-	var tables int
-	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('tasks','task_events','outbox','task_attempts','task_dead_letters','task_replay_receipts')`).Scan(&tables); err != nil || tables != 6 {
-		t.Fatalf("migration tables=%d err=%v", tables, err)
+	// POST published each task; the sweeper has nothing left to publish.
+	assertQueueCount(t, s.ctx, s, s.queue("integration.source.tasks"), len(ids))
+	if count, err := svc.PublishPending(s.ctx); err != nil || count != 0 {
+		t.Fatalf("publisher batch=%d,%v", count, err)
 	}
-	pgStore := &postgres.Store{DB: db}
-
-	rabbit, err := testcontainers.Run(ctx, "rabbitmq:3.13-alpine",
-		testcontainers.WithEnv(map[string]string{"RABBITMQ_DEFAULT_USER": "task", "RABBITMQ_DEFAULT_PASS": "task"}),
-		testcontainers.WithExposedPorts("5672/tcp"), testcontainers.WithWaitStrategy(wait.ForListeningPort("5672/tcp").WithStartupTimeout(time.Minute)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = testcontainers.TerminateContainer(rabbit) })
-	host, err := rabbit.Host(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	port, err := rabbit.MappedPort(ctx, "5672/tcp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Exercise the production transaction and outbox publisher against both services.
-	client := rabbitmq.New(rabbitmq.Config{URL: fmt.Sprintf("amqp://task:task@%s:%s/", host, port.Port()), Queue: "integration.tasks", RetryQueue: "integration.retry", DeadQueue: "integration.dead", RetryDelay: 100 * time.Millisecond})
-	t.Cleanup(func() { _ = client.Close() })
-	payload, _ := domain.NewPayload([]byte(`{"job":"integration"}`))
-	created, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, usecase.SubmitTaskRequest{Payload: payload.JSON()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	count, err := (usecase.Relay{Outbox: pgStore, Publisher: client, Batch: 16}).Once(ctx)
-	if err != nil || count != 1 {
-		t.Fatalf("relay published=%d err=%v", count, err)
-	}
-	var eventCount, outboxCount int
-	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1`, created.ID).Scan(&eventCount); err != nil {
-		t.Fatal(err)
-	}
-	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE task_id=$1 AND published_at IS NOT NULL`, created.ID).Scan(&outboxCount); err != nil {
-		t.Fatal(err)
-	}
-	if eventCount != 1 || outboxCount != 1 {
-		t.Fatalf("transactional submit events=%d published outbox=%d", eventCount, outboxCount)
-	}
-	consumer := usecase.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: processorapp.SimulatedProcessor{}}
-	workStarted := time.Now()
-	workPhase, stopWorkPhase := context.WithTimeout(ctx, 30*time.Second)
-	defer stopWorkPhase()
-	worker := startConsumer(t, ctx, client, 2, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		return consumer.Process(c, req)
-	})
-	deadline := time.NewTicker(20 * time.Millisecond)
-	defer deadline.Stop()
-	for {
-		state, getErr := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Get(workPhase, usecase.TaskRequest{ID: string(created.ID)})
-		if getErr != nil {
-			t.Fatal(getErr)
-		}
-		if state.Status == string(domain.Completed) {
-			if elapsed := time.Since(workStarted); elapsed < 3*time.Second {
-				t.Fatalf("sample work completed too early: %s", elapsed)
-			}
-			if state.Result == nil || *state.Result != "processed" {
-				t.Fatalf("sample work result=%+v", state)
-			}
-			break
-		}
-		select {
-		case <-deadline.C:
-		case <-workPhase.Done():
-			t.Fatal(workPhase.Err())
-		case <-worker.done:
-			t.Fatalf("worker exited before completing: %v", worker.err)
+	for _, id := range ids {
+		state, err := svc.Get(s.ctx, string(id))
+		if err != nil || !state.IsSubmitted {
+			t.Fatalf("publication marker=%+v,%v", state, err)
 		}
 	}
-	if err = worker.Stop(); err != nil {
-		t.Fatalf("worker stop: %v", err)
-	}
-	// Two queued jobs must both enter processing before either processor is released.
-	concurrentIDs := make([]domain.ID, 2)
-	for i := range concurrentIDs {
-		p, _ := domain.NewPayload([]byte(`{"job":"parallel"}`))
-		created, submitErr := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, usecase.SubmitTaskRequest{Payload: p.JSON()})
-		if submitErr != nil {
-			t.Fatal(submitErr)
-		}
-		concurrentIDs[i] = domain.ID(created.ID)
-	}
-	count, err = (usecase.Relay{Outbox: pgStore, Publisher: client, Batch: 16}).Once(ctx)
-	if err != nil || count != 2 {
-		t.Fatalf("relay parallel jobs=%d err=%v", count, err)
-	}
-	barrier := &barrierProcessor{started: make(chan struct{}, 2), release: make(chan struct{})}
-	parallelPhase, stopParallelPhase := context.WithTimeout(ctx, 30*time.Second)
-	defer stopParallelPhase()
-	parallelConsumer := usecase.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: barrier}
-	parallel := startConsumer(t, ctx, client, 2, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		return parallelConsumer.Process(c, req)
-	})
-	for i := 0; i < 2; i++ {
-		select {
-		case <-barrier.started:
-		case <-parallelPhase.Done():
-			close(barrier.release)
-			t.Fatal(parallelPhase.Err())
-		case <-parallel.done:
-			close(barrier.release)
-			t.Fatalf("parallel worker exited: %v", parallel.err)
-		}
-	}
-	close(barrier.release)
-	for _, id := range concurrentIDs {
-		for {
-			state, getErr := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Get(parallelPhase, usecase.TaskRequest{ID: string(id)})
-			if getErr != nil {
-				t.Fatal(getErr)
-			}
-			if state.Status == string(domain.Completed) {
-				break
-			}
-			select {
-			case <-time.After(20 * time.Millisecond):
-			case <-parallelPhase.Done():
-				t.Fatal(parallelPhase.Err())
-			}
-		}
-	}
-	if err = parallel.Stop(); err != nil {
-		t.Fatalf("parallel worker stop: %v", err)
-	}
-	// A broker-level duplicate delivery after completion remains a no-op.
-	duplicateRequest := currentProcessRequest(ctx, t, pgStore, db, domain.ID(created.ID))
-	if err = client.Publish(ctx, usecase.Message{EventID: domain.ID(duplicateRequest.EventID), TaskID: domain.ID(duplicateRequest.ID), ExecutionID: domain.ID(duplicateRequest.ExecutionID), Destination: usecase.DestinationWork}); err != nil {
-		t.Fatal(err)
-	}
-	duplicateSeen := make(chan struct{}, 1)
-	duplicateWorker := startConsumer(t, ctx, client, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		err := consumer.Process(c, req)
-		duplicateSeen <- struct{}{}
-		return err
-	})
-	select {
-	case <-duplicateSeen:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	case <-duplicateWorker.done:
-		t.Fatalf("duplicate consumer exited: %v", duplicateWorker.err)
-	}
-	if err = duplicateWorker.Stop(); err != nil {
-		t.Fatalf("duplicate consumer stop: %v", err)
-	}
-	state, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, usecase.TaskRequest{ID: string(created.ID)})
-	if err != nil || state.Status != string(domain.Completed) || state.Attempts != 1 || state.Result == nil || *state.Result != "processed" {
-		t.Fatalf("worker result=%+v err=%v", state, err)
-	}
-	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1`, created.ID).Scan(&eventCount); err != nil || eventCount != 3 {
-		t.Fatalf("event history=%d err=%v", eventCount, err)
-	}
-
-	rollbackPayload, _ := domain.NewPayload([]byte(`{"job":"rollback"}`))
-	rollbackTask, _ := domain.Submit(rollbackPayload, time.Now())
-	wantFailure := errors.New("force rollback")
-	if err = pgStore.Within(ctx, func(r usecase.Repository) error {
-		if e := r.Insert(ctx, rollbackTask); e != nil {
-			return e
-		}
-		return wantFailure
-	}); !errors.Is(err, wantFailure) {
-		t.Fatalf("rollback callback error=%v", err)
-	}
-	var rolledBack int
-	if err = db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM tasks WHERE id=$1)+(SELECT count(*) FROM task_events WHERE task_id=$1)+(SELECT count(*) FROM outbox WHERE task_id=$1)`, rollbackTask.Snapshot().ID).Scan(&rolledBack); err != nil || rolledBack != 0 {
-		t.Fatalf("rollback left %d rows: %v", rolledBack, err)
-	}
-
-	cancelPayload, _ := domain.NewPayload([]byte(`{}`))
-	cancelTask, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, usecase.SubmitTaskRequest{Payload: cancelPayload.JSON()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	started, release := make(chan struct{}), make(chan struct{})
-	var releaseOnce sync.Once
-	unblock := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(unblock)
-	cancelConsumer := usecase.Consumer{Store: pgStore, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: blockingProcessor{started, release}}
-	cancelRequest := currentProcessRequest(ctx, t, pgStore, db, domain.ID(cancelTask.ID))
-	procDone := make(chan error, 1)
-	go func() {
-		procDone <- cancelConsumer.Process(ctx, cancelRequest)
-	}()
-	select {
-	case <-started:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	if _, err = (usecase.Tasks{Store: pgStore, Clock: time.Now}).Cancel(ctx, usecase.TaskRequest{ID: string(cancelTask.ID)}); err != nil {
-		unblock()
-		t.Fatal(err)
-	}
-	unblock()
-	if err = <-procDone; err != nil {
-		t.Fatal(err)
-	}
-	canceled, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, usecase.TaskRequest{ID: string(cancelTask.ID)})
-	if err != nil || canceled.Status != string(domain.Canceled) {
-		t.Fatalf("cancellation state=%+v err=%v", canceled, err)
-	}
-
-	leaseTask, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, usecase.SubmitTaskRequest{Payload: cancelPayload.JSON()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstStarted, firstRelease := make(chan struct{}), make(chan struct{})
-	var firstReleaseOnce sync.Once
-	allowStaleFinish := func() { firstReleaseOnce.Do(func() { close(firstRelease) }) }
-	t.Cleanup(allowStaleFinish)
-	var executions int
-	var execMu sync.Mutex
-	baseTime := time.Now().UTC()
-	var clockCalls atomic.Int64
-	leaseClock := func() time.Time {
-		n := clockCalls.Add(1)
-		if n == 1 {
-			return baseTime
-		}
-		return baseTime.Add(60*time.Millisecond + time.Duration(n-1)*time.Millisecond)
-	}
-	leaseProcessor := integrationProcessorFunc(func(context.Context, domain.ID, domain.Payload) (string, error) {
-		execMu.Lock()
-		executions++
-		n := executions
-		execMu.Unlock()
-		if n == 1 {
-			close(firstStarted)
-			<-firstRelease
-			return "stale", nil
-		}
-		return "new owner", nil
-	})
-	firstConsumer := usecase.Consumer{Store: pgStore, Clock: leaseClock, Lease: 60 * time.Millisecond, Timeout: time.Second, Processor: leaseProcessor}
-	firstRequest := currentProcessRequest(ctx, t, pgStore, db, domain.ID(leaseTask.ID))
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- firstConsumer.Process(ctx, firstRequest) }()
-	select {
-	case <-firstStarted:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	secondConsumer := usecase.Consumer{Store: pgStore, Clock: leaseClock, Lease: time.Second, Timeout: time.Second, Processor: leaseProcessor}
-	if err = secondConsumer.Process(ctx, currentProcessRequest(ctx, t, pgStore, db, domain.ID(leaseTask.ID))); err != nil {
-		allowStaleFinish()
-		t.Fatal(err)
-	}
-	allowStaleFinish()
-	if err = <-firstDone; err != nil {
-		t.Fatal(err)
-	}
-	recovered, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, usecase.TaskRequest{ID: string(leaseTask.ID)})
-	if err != nil || recovered.Status != string(domain.Completed) || recovered.Attempts != 2 || recovered.Result == nil || *recovered.Result != "new owner" {
-		t.Fatalf("lease recovery=%+v err=%v", recovered, err)
-	}
-
-	conn, err := amqp091.Dial(fmt.Sprintf("amqp://task:task@%s:%s/", host, port.Port()))
+	// Source exchange and content contract also allow an original Python producer.
+	conn, err := amqp.Dial(s.brokerURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,482 +74,318 @@ func TestPostgresAndRabbitMQ(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ch.Close()
-	if err = ch.Publish("", "integration.tasks", false, false, amqp091.Publishing{ContentType: "application/json", Body: []byte(`{"task_id":`)}); err != nil {
+	if err = ch.ExchangeDeclarePassive("direct", "direct", true, false, false, false, nil); err != nil {
 		t.Fatal(err)
 	}
-	poisonWorker := startConsumer(t, ctx, client, 1, func(context.Context, usecase.ProcessTaskRequest) error {
-		return errors.New("poison handler must not run")
-	})
-	poisonPhase, stopPoisonPhase := context.WithTimeout(ctx, 30*time.Second)
-	defer stopPoisonPhase()
-	for {
-		info, inspectErr := ch.QueueInspect("integration.dead")
-		if inspectErr == nil && info.Messages > 0 {
-			break
+	var deliveries int
+	for deliveries < 4 {
+		d, ok, err := ch.Get(s.queue("integration.source.tasks"), false)
+		if err != nil || !ok {
+			t.Fatalf("source message missing: %v", err)
 		}
-		select {
-		case <-time.After(25 * time.Millisecond):
-		case <-poisonPhase.Done():
-			t.Fatal(poisonPhase.Err())
-		case <-poisonWorker.done:
-			t.Fatalf("poison consumer exited: %v", poisonWorker.err)
+		_, idErr := domain.ParseID(string(d.Body))
+		if d.ContentType != "text/plain" || idErr != nil {
+			t.Fatalf("message contract: type=%s body=%s", d.ContentType, d.Body)
 		}
-	}
-	if err = poisonWorker.Stop(); err != nil {
-		t.Fatalf("poison consumer stop: %v", err)
-	}
-	var quarantine rabbitmq.FailureEnvelope
-	scan, scanErr := client.ScanDeadLetters(ctx, 10, "", func(item rabbitmq.DeadLetterItem) error {
-		var parseErr error
-		quarantine, parseErr = rabbitmq.ParseFailureEnvelope(item.Body)
-		return parseErr
-	})
-	if scanErr != nil || scan.Scanned != 1 || quarantine.Failure.Category != "malformed_envelope" || string(quarantine.Failure.Original) != `{"task_id":` {
-		t.Fatalf("malformed envelope quarantine scan=%+v failure=%+v err=%v", scan, quarantine.Failure, scanErr)
-	}
-	poisonHash := sha256.Sum256([]byte(`{"task_id":`))
-	if quarantine.Failure.OriginalHash != hex.EncodeToString(poisonHash[:]) || quarantine.Failure.OriginalTruncated {
-		t.Fatalf("malformed envelope capture hash/truncation=%s/%t", quarantine.Failure.OriginalHash, quarantine.Failure.OriginalTruncated)
-	}
-	unknownDelivery := usecase.Message{EventID: domain.NewID(), TaskID: domain.NewID(), ExecutionID: domain.NewID(), Destination: usecase.DestinationWork}
-	unknownEnvelope, err := json.Marshal(struct {
-		Version     int       `json:"version"`
-		EventID     domain.ID `json:"event_id"`
-		TaskID      domain.ID `json:"task_id"`
-		ExecutionID domain.ID `json:"execution_id"`
-	}{1, unknownDelivery.EventID, unknownDelivery.TaskID, unknownDelivery.ExecutionID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = client.Publish(ctx, unknownDelivery); err != nil {
-		t.Fatal(err)
-	}
-	unknownWorker := startConsumer(t, ctx, client, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		return consumer.Process(c, req)
-	})
-	unknownPhase, stopUnknownPhase := context.WithTimeout(ctx, 20*time.Second)
-	defer stopUnknownPhase()
-	for {
-		info, inspectErr := ch.QueueInspect("integration.dead")
-		if inspectErr == nil && info.Messages >= 2 {
-			break
+		if err = d.Nack(false, true); err != nil {
+			t.Fatal(err)
 		}
-		select {
-		case <-time.After(25 * time.Millisecond):
-		case <-unknownPhase.Done():
-			t.Fatal(unknownPhase.Err())
-		case <-unknownWorker.done:
-			t.Fatalf("unknown-task worker exited: %v", unknownWorker.err)
+		deliveries++
+	}
+	// Requeued messages may be returned again, so inspect identity without
+	// assuming queue order after NACK: all work still executes from current rows.
+	consumer := startBatchConsumer(t, s.ctx, client, svc, execute, retryDelays, nil)
+	results := []string{"0", "14", "3", "1024"}
+	for i, id := range ids {
+		state := waitForStatus(t, s.ctx, svc, id, domain.Completed)
+		if state.Result == nil || *state.Result != results[i] || state.Error != nil {
+			t.Fatalf("completion=%+v", state)
 		}
-	}
-	if err = unknownWorker.Stop(); err != nil {
-		t.Fatal(err)
-	}
-	var malformedFound, unknownFound bool
-	scan, scanErr = client.ScanDeadLetters(ctx, 10, "", func(item rabbitmq.DeadLetterItem) error {
-		failure, parseErr := rabbitmq.ParseFailureEnvelope(item.Body)
-		if parseErr != nil {
-			return parseErr
-		}
-		switch failure.Failure.Category {
-		case "malformed_envelope":
-			malformedFound = string(failure.Failure.Original) == `{"task_id":`
-		case "unknown_task":
-			unknownFound = string(failure.Failure.Original) == string(unknownEnvelope)
-			unknownHash := sha256.Sum256(unknownEnvelope)
-			unknownFound = unknownFound && failure.Failure.OriginalHash == hex.EncodeToString(unknownHash[:]) && !failure.Failure.OriginalTruncated
-		}
-		return nil
-	})
-	if scanErr != nil || scan.Scanned != 2 || !malformedFound || !unknownFound {
-		t.Fatalf("quarantine captures scan=%+v malformed=%t unknown=%t err=%v", scan, malformedFound, unknownFound, scanErr)
-	}
-
-	api := &httpapi.API{Tasks: usecase.Tasks{Store: pgStore, Clock: time.Now}, Ready: func(ctx context.Context) error { return db.PingContext(ctx) }}
-	server := httptest.NewServer(api.Handler())
-	defer server.Close()
-	apiClient := queueClient(host, port.Port(), "integration.api")
-	t.Cleanup(func() { _ = apiClient.Close() })
-	submitHTTP := func() domain.ID {
-		t.Helper()
-		resp, e := http.Post(server.URL+"/tasks", "application/json", strings.NewReader(`{"payload":{"http":true}}`))
-		if e != nil {
-			t.Fatal(e)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusAccepted {
-			t.Fatalf("HTTP submit status %d", resp.StatusCode)
-		}
-		var body struct {
-			ID domain.ID `json:"id"`
-		}
-		if e = json.NewDecoder(resp.Body).Decode(&body); e != nil || body.ID == "" {
-			t.Fatalf("HTTP create response: %+v %v", body, e)
-		}
-		return body.ID
-	}
-	cancelHTTP := func(id domain.ID) *http.Response {
-		t.Helper()
-		req, e := http.NewRequest(http.MethodPost, server.URL+"/tasks/"+string(id)+":cancel", nil)
-		if e != nil {
-			t.Fatal(e)
-		}
-		resp, e := http.DefaultClient.Do(req)
-		if e != nil {
-			t.Fatal(e)
-		}
-		return resp
-	}
-	completedHTTP := submitHTTP()
-	instant := usecase.Consumer{Store: pgStore, Clock: time.Now, Lease: time.Second, Timeout: time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.ID, domain.Payload) (string, error) { return "complete", nil })}
-	if err = instant.Process(ctx, currentProcessRequest(ctx, t, pgStore, db, completedHTTP)); err != nil {
-		t.Fatal(err)
-	}
-	response := cancelHTTP(completedHTTP)
-	response.Body.Close()
-	if response.StatusCode != http.StatusConflict {
-		t.Fatalf("completed HTTP cancel status=%d", response.StatusCode)
-	}
-	pendingHTTP := submitHTTP()
-	response = cancelHTTP(pendingHTTP)
-	if response.StatusCode != http.StatusOK {
-		response.Body.Close()
-		t.Fatalf("pending HTTP cancel status=%d", response.StatusCode)
-	}
-	response.Body.Close()
-	count, err = (usecase.Relay{Outbox: pgStore, Publisher: apiClient, Batch: 32}).Once(ctx)
-	if err != nil || count < 2 {
-		t.Fatalf("relay API tasks=%d err=%v", count, err)
-	}
-	seen := make(chan struct{}, count)
-	apiPhase, stopAPIPhase := context.WithTimeout(ctx, 30*time.Second)
-	defer stopAPIPhase()
-	apiWorker := startConsumer(t, ctx, apiClient, 2, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		err := instant.Process(c, req)
-		seen <- struct{}{}
-		return err
-	})
-	for i := 0; i < count; i++ {
-		select {
-		case <-seen:
-		case <-apiPhase.Done():
-			t.Fatal(apiPhase.Err())
-		case <-apiWorker.done:
-			t.Fatalf("API delivery worker exited: %v", apiWorker.err)
-		}
-	}
-	if err = apiWorker.Stop(); err != nil {
-		t.Fatalf("API worker stop: %v", err)
-	}
-	if err = apiClient.Close(); err != nil {
-		t.Fatalf("API broker close: %v", err)
-	}
-	pendingState, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, usecase.TaskRequest{ID: string(pendingHTTP)})
-	if err != nil || pendingState.Status != string(domain.Canceled) || pendingState.Attempts != 0 {
-		t.Fatalf("pending cancel state=%+v err=%v", pendingState, err)
-	}
-
-	// A transient storage failure is retried through RabbitMQ, then completed after the store recovers.
-	retryPayload, _ := domain.NewPayload([]byte(`{"job":"storage-retry"}`))
-	retryTask, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, usecase.SubmitTaskRequest{Payload: retryPayload.JSON()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	retryClient := queueClient(host, port.Port(), "integration.storage")
-	t.Cleanup(func() { _ = retryClient.Close() })
-	count, err = (usecase.Relay{Outbox: pgStore, Publisher: retryClient, Batch: 16}).Once(ctx)
-	if err != nil || count != 1 {
-		t.Fatalf("retry relay count=%d err=%v", count, err)
-	}
-	closedDB, err := sql.Open("postgres", databaseURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = closedDB.Close(); err != nil {
-		t.Fatal(err)
-	}
-	closedStore := &postgres.Store{DB: closedDB}
-	observedClosedStore := &signalStore{inner: closedStore, failed: make(chan struct{}, 1)}
-	switchable := &switchStore{current: observedClosedStore}
-	retryConsumer := usecase.Consumer{Store: switchable, Clock: time.Now, Lease: 10 * time.Second, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.ID, domain.Payload) (string, error) { return "recovered", nil })}
-	seenFailure := make(chan domain.ID, 1)
-	retryWorker := startConsumer(t, ctx, retryClient, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		seenFailure <- domain.ID(req.ID)
-		return retryConsumer.Process(c, req)
-	})
-	retryPhase, stopRetryPhase := context.WithTimeout(ctx, 30*time.Second)
-	defer stopRetryPhase()
-	select {
-	case id := <-seenFailure:
-		if string(id) != retryTask.ID {
-			t.Fatalf("storage failure received unexpected task %s, wanted %s", id, retryTask.ID)
-		}
-	case <-retryPhase.Done():
-		t.Fatal(retryPhase.Err())
-	case <-retryWorker.done:
-		t.Fatalf("retry worker exited: %v", retryWorker.err)
-	}
-	select {
-	case <-observedClosedStore.failed:
-		switchable.Set(pgStore)
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	case <-retryWorker.done:
-		t.Fatalf("retry worker exited: %v", retryWorker.err)
-	}
-	retryState := waitForStatus(t, ctx, usecase.Tasks{Store: pgStore, Clock: time.Now}, domain.ID(retryTask.ID), domain.Completed)
-	if retryState.Attempts != 1 || retryState.Result == nil || *retryState.Result != "recovered" {
-		t.Fatalf("storage retry result=%+v", retryState)
-	}
-	if err = retryWorker.Stop(); err != nil {
-		t.Fatalf("retry worker stop: %v", err)
-	}
-	if err = retryClient.Close(); err != nil {
-		t.Fatalf("storage retry client close: %v", err)
-	}
-
-	// A broker outage releases the claimed outbox lease; making it due again permits confirmed delivery.
-	failurePayload, _ := domain.NewPayload([]byte(`{"job":"broker-retry"}`))
-	failureTask, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, usecase.SubmitTaskRequest{Payload: failurePayload.JSON()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalidBroker := rabbitmq.New(rabbitmq.Config{URL: "amqp://task:task@127.0.0.1:1/", DialTimeout: 50 * time.Millisecond})
-	count, relayErr := (usecase.Relay{Outbox: pgStore, Publisher: invalidBroker, Batch: 1}).Once(ctx)
-	if relayErr == nil || count != 0 {
-		t.Fatalf("unavailable broker relay count=%d err=%v", count, relayErr)
-	}
-	var published sql.NullTime
-	var leaseToken, leaseUntil sql.NullString
-	if err = db.QueryRowContext(ctx, `SELECT published_at,lease_token,lease_until FROM outbox WHERE task_id=$1`, failureTask.ID).Scan(&published, &leaseToken, &leaseUntil); err != nil || published.Valid || leaseToken.Valid || leaseUntil.Valid {
-		t.Fatalf("failed publish outbox published=%v lease=%v/%v err=%v", published, leaseToken, leaseUntil, err)
-	}
-	if _, err = db.ExecContext(ctx, `UPDATE outbox SET available_at=now() WHERE task_id=$1`, failureTask.ID); err != nil {
-		t.Fatal(err)
-	}
-	failureClient := queueClient(host, port.Port(), "integration.failure")
-	t.Cleanup(func() { _ = failureClient.Close() })
-	count, err = (usecase.Relay{Outbox: pgStore, Publisher: failureClient, Batch: 1}).Once(ctx)
-	if err != nil || count != 1 {
-		t.Fatalf("recovered relay count=%d err=%v", count, err)
-	}
-	recoveryWorker := startConsumer(t, ctx, failureClient, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		return consumer.Process(c, req)
-	})
-	recoveredFailure := waitForStatus(t, ctx, usecase.Tasks{Store: pgStore, Clock: time.Now}, domain.ID(failureTask.ID), domain.Completed)
-	if recoveredFailure.Attempts != 1 || recoveredFailure.Result == nil || *recoveredFailure.Result != "processed" {
-		t.Fatalf("recovered broker task=%+v", recoveredFailure)
-	}
-	if err = recoveryWorker.Stop(); err != nil {
-		t.Fatalf("recovered task worker stop: %v", err)
-	}
-	if err = failureClient.Close(); err != nil {
-		t.Fatalf("failure retry client close: %v", err)
-	}
-
-	// Closing a worker connection returns its unacked delivery. A new lease owner reclaims it.
-	shutdownPayload, _ := domain.NewPayload([]byte(`{"job":"worker-restart"}`))
-	shutdownTask, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Submit(ctx, usecase.SubmitTaskRequest{Payload: shutdownPayload.JSON()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	shutdownClient := queueClient(host, port.Port(), "integration.shutdown")
-	t.Cleanup(func() { _ = shutdownClient.Close() })
-	count, err = (usecase.Relay{Outbox: pgStore, Publisher: shutdownClient, Batch: 16}).Once(ctx)
-	if err != nil || count != 1 {
-		t.Fatalf("shutdown relay count=%d err=%v", count, err)
-	}
-	firstTime := time.Now().UTC()
-	firstStarted := make(chan struct{}, 1)
-	shutdownConsumer := usecase.Consumer{Store: pgStore, Clock: func() time.Time { return firstTime }, Lease: 100 * time.Millisecond, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(c context.Context, _ domain.ID, _ domain.Payload) (string, error) {
-		firstStarted <- struct{}{}
-		<-c.Done()
-		return "", c.Err()
-	})}
-	shutdownWorker := startConsumer(t, ctx, shutdownClient, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		return shutdownConsumer.Process(c, req)
-	})
-	shutdownPhase, stopShutdownPhase := context.WithTimeout(ctx, 30*time.Second)
-	defer stopShutdownPhase()
-	select {
-	case <-firstStarted:
-	case <-shutdownPhase.Done():
-		t.Fatal(shutdownPhase.Err())
-	case <-shutdownWorker.done:
-		t.Fatalf("shutdown worker exited: %v", shutdownWorker.err)
-	}
-	if err = shutdownWorker.Stop(); err != nil {
-		t.Fatalf("shutdown worker stop: %v", err)
-	}
-	if err = shutdownClient.Close(); err != nil {
-		t.Fatalf("closing interrupted broker connection: %v", err)
-	}
-	interrupted, err := (usecase.Tasks{Store: pgStore, Clock: time.Now}).Get(ctx, usecase.TaskRequest{ID: string(shutdownTask.ID)})
-	if err != nil || interrupted.Status != string(domain.Processing) || interrupted.Attempts != 1 {
-		t.Fatalf("interrupted task=%+v err=%v", interrupted, err)
-	}
-	replacementClient := queueClient(host, port.Port(), "integration.shutdown")
-	t.Cleanup(func() { _ = replacementClient.Close() })
-	replacementConsumer := usecase.Consumer{Store: pgStore, Clock: func() time.Time { return firstTime.Add(101 * time.Millisecond) }, Lease: time.Second, Timeout: 5 * time.Second, Processor: integrationProcessorFunc(func(context.Context, domain.ID, domain.Payload) (string, error) { return "replacement", nil })}
-	replacementWorker := startConsumer(t, ctx, replacementClient, 1, func(c context.Context, req usecase.ProcessTaskRequest) error {
-		return replacementConsumer.Process(c, req)
-	})
-	restarted := waitForStatus(t, ctx, usecase.Tasks{Store: pgStore, Clock: time.Now}, domain.ID(shutdownTask.ID), domain.Completed)
-	if restarted.Attempts != 2 || restarted.Result == nil || *restarted.Result != "replacement" {
-		t.Fatalf("restarted worker result=%+v", restarted)
-	}
-	if err = replacementWorker.Stop(); err != nil {
-		t.Fatalf("replacement worker stop: %v", err)
-	}
-	if err = replacementClient.Close(); err != nil {
-		t.Fatalf("replacement client close: %v", err)
-	}
-
-	_ = db.Close()
-	if _, err = pgStore.Get(ctx, domain.ID(created.ID)); err == nil {
-		t.Fatal("database read unexpectedly succeeded after close")
-	}
-}
-
-type integrationProcessorFunc func(context.Context, domain.ID, domain.Payload) (string, error)
-
-func (f integrationProcessorFunc) Execute(ctx context.Context, id domain.ID, p domain.Payload) (string, error) {
-	return f(ctx, id, p)
-}
-
-func queueClient(host, port, prefix string) *rabbitmq.Client {
-	return rabbitmq.New(rabbitmq.Config{URL: fmt.Sprintf("amqp://task:task@%s:%s/", host, port), Queue: prefix + ".tasks", RetryQueue: prefix + ".retry", DeadQueue: prefix + ".dead", RetryDelay: 100 * time.Millisecond})
-}
-
-type blockingProcessor struct {
-	started chan struct{}
-	release chan struct{}
-}
-
-type runningConsumer struct {
-	cancel   context.CancelFunc
-	done     chan struct{}
-	stopOnce sync.Once
-	err      error
-}
-
-func startConsumer(t *testing.T, parent context.Context, client *rabbitmq.Client, workers int, handler func(context.Context, usecase.ProcessTaskRequest) error) *runningConsumer {
-	t.Helper()
-	ctx, cancel := context.WithCancel(parent)
-	r := &runningConsumer{cancel: cancel, done: make(chan struct{})}
-	processor := usecase.TaskProcessorFunc(handler)
-	go func() { r.err = client.Consume(ctx, workers, processor); close(r.done) }()
-	t.Cleanup(func() { _ = r.Stop() })
-	return r
-}
-
-func waitForStatus(t *testing.T, parent context.Context, tasks usecase.Tasks, id domain.ID, want domain.Status) domain.Snapshot {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	defer cancel()
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		state, err := tasks.Get(ctx, usecase.TaskRequest{ID: string(id)})
+		response, err := http.Get(server.URL + "/tasks/" + string(id))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if state.Status == string(want) {
-			stored, storeErr := tasks.Store.Get(ctx, id)
-			if storeErr != nil {
-				t.Fatal(storeErr)
-			}
-			return stored.Snapshot()
+		var dto struct {
+			Status      *int    `json:"status"`
+			IsSubmitted *bool   `json:"is_submitted"`
+			Result      *string `json:"result"`
+			Error       *string `json:"error"`
 		}
+		err = json.NewDecoder(response.Body).Decode(&dto)
+		_ = response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusOK || dto.Status == nil || *dto.Status != 1 || dto.IsSubmitted == nil || !*dto.IsSubmitted || dto.Result == nil || *dto.Result != results[i] || dto.Error != nil {
+			t.Fatalf("completed HTTP task=%+v status=%d err=%v", dto, response.StatusCode, err)
+		}
+	}
+	if err := consumer.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodDelete, server.URL+"/tasks/"+string(ids[0]), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("completed deletion=%d", resp.StatusCode)
+	}
+	if _, err := svc.Get(s.ctx, string(ids[0])); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("deleted task remains accessible: %v", err)
+	}
+}
+
+// A running row is skipped by every delivery: the batch executes only the
+// pending task, and running rows reject edits and deletes.
+func TestBatchRunningGuardsAndSkipsRunningClaims(t *testing.T) {
+	s := newPostgresStack(t, true)
+	svc := usecase.NewTaskUseCase(s.repo, sweeperOnly, time.Now)
+	first := submitTask(t, s.ctx, svc, "first")
+	second := submitTask(t, s.ctx, svc, "second")
+	// Another consumer holds first; this batch must leave its claim alone.
+	if err := s.repo.UpdateByID(s.ctx, first.ID, first.Version, func(t *domain.Task) (bool, error) { return t.Start(time.Now()) }); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	releaseWork := sync.OnceFunc(func() { close(release) })
+	defer releaseWork()
+	var execute usecase.Work = func(ctx context.Context) error {
+		started <- struct{}{}
 		select {
-		case <-ticker.C:
+		case <-release:
+			return nil
 		case <-ctx.Done():
-			t.Fatalf("task %s did not reach %s (last status %s): %v", id, want, state.Status, ctx.Err())
+			return ctx.Err()
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.ProcessTasks(s.ctx, []domain.ID{first.ID, second.ID, domain.NewID()}, execute, retryDelays)
+	}()
+	for i := 0; i < 1; i++ {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("batch did not start")
+		}
+	}
+	// Version 0 (no If-Match) locks the current row without comparing versions;
+	// the running flag must still reject the mutation.
+	for _, item := range []*domain.Task{first, second} {
+		if _, err := svc.Update(s.ctx, string(item.ID), "edited", []byte("edited"), 0); !errors.Is(err, domain.ErrBusy) {
+			t.Fatalf("running edit was accepted: %v", err)
+		}
+		if err := svc.Delete(s.ctx, string(item.ID), 0); !errors.Is(err, domain.ErrBusy) {
+			t.Fatalf("running delete was accepted: %v", err)
+		}
+	}
+	releaseWork()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.repo.Get(s.ctx, first.ID)
+	b, _ := s.repo.Get(s.ctx, second.ID)
+	if a.Status != domain.Processing || !a.IsRunning || a.Version != first.Version+1 || a.RetryCount != 0 || b.Status != domain.Completed || b.IsRunning || b.Result == nil || *b.Result != "6" {
+		t.Fatalf("states=%+v/%+v", a, b)
+	}
+	if _, err := svc.Update(s.ctx, string(first.ID), "edited", []byte("edited"), 0); !errors.Is(err, domain.ErrBusy) {
+		t.Fatalf("held claim edit=%v", err)
+	}
+	// The background claim and outcome advanced Version: a stale If-Match
+	// conflicts, while no If-Match edits or deletes the current row.
+	if _, err := svc.Update(s.ctx, string(second.ID), "edited", []byte("edited"), second.Version); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("stale If-Match edit=%v", err)
+	}
+	if edited, err := svc.Update(s.ctx, string(second.ID), "edited", []byte("edited"), 0); err != nil || edited.Name != "edited" || edited.Version != b.Version+1 || edited.Status != domain.Pending {
+		t.Fatalf("edit without If-Match=%+v,%v", edited, err)
+	}
+	if err := svc.Delete(s.ctx, string(second.ID), second.Version); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("stale If-Match delete=%v", err)
+	}
+	if err := svc.Delete(s.ctx, string(second.ID), 0); err != nil {
+		t.Fatalf("delete without If-Match=%v", err)
+	}
+	// Batch callback failure cannot persist a partial transition.
+	third := submitTask(t, s.ctx, svc, "third")
+	fourth := submitTask(t, s.ctx, svc, "fourth")
+	err := s.repo.UpdateByIDs(s.ctx, []domain.ID{third.ID, fourth.ID}, func(items []*domain.Task) (bool, error) {
+		for _, item := range items {
+			_, _ = item.Start(time.Now())
+		}
+		return true, errors.New("rollback")
+	})
+	if err == nil {
+		t.Fatal("expected rollback error")
+	}
+	for _, id := range []domain.ID{third.ID, fourth.ID} {
+		state, _ := s.repo.Get(s.ctx, id)
+		if state.Status != domain.Pending || state.IsRunning {
+			t.Fatalf("partial batch persisted=%+v", state)
 		}
 	}
 }
 
-// Direct consumer calls in this stack test still carry the same delivery identity
-// that RabbitMQ would provide: the current execution generation and its work event.
-func currentProcessRequest(ctx context.Context, t *testing.T, store usecase.Store, db *sql.DB, id domain.ID) usecase.ProcessTaskRequest {
-	t.Helper()
-	task, err := store.Get(ctx, id)
+func TestUnsubmittedRecoveryHandlesTimestampTies(t *testing.T) {
+	s := newIntegrationStack(t)
+	client := s.client(t, "integration.recovery")
+	now := time.Now().UTC()
+	svc := usecase.NewTaskUseCase(s.repo, sweeperOnly, func() time.Time { return now })
+	var ids []domain.ID
+	for i := 0; i < 5; i++ {
+		created := submitTask(t, s.ctx, svc, "recovery")
+		ids = append(ids, created.ID)
+	}
+	publication := newPublishingTaskUseCase(s, client, 2)
+	publication.Clock = func() time.Time { return now.Add(publication.PublishGrace) }
+	total := 0
+	for i := 0; i < 4; i++ {
+		n, err := publication.PublishPending(s.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += n
+	}
+	if total != 5 {
+		t.Fatalf("recovered tied timestamps=%d", total)
+	}
+	for _, id := range ids {
+		state, _ := s.repo.Get(s.ctx, id)
+		if !state.IsSubmitted {
+			t.Fatalf("submitted=%v for %s", state.IsSubmitted, id)
+		}
+	}
+	var execute usecase.Work = func(context.Context) error { return nil }
+	consumer := startBatchConsumer(t, s.ctx, client, svc, execute, retryDelays, nil)
+	for _, id := range ids {
+		waitForStatus(t, s.ctx, svc, id, domain.Completed)
+	}
+	if err := consumer.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A task whose claim keeps going stale spends one network retry per release
+// and completes as abandoned once the retry budget is exhausted. Only claims
+// not updated for staleAfter by the database clock are released, whatever the
+// caller's clock says. Rows are released by domain.Task.Interrupt in Go.
+func TestReleaseStaleAbandonsCrashLoopingTask(t *testing.T) {
+	s := newPostgresStack(t, true)
+	svc := usecase.NewTaskUseCase(s.repo, sweeperOnly, time.Now)
+	created := submitTask(t, s.ctx, svc, "poison")
+	delays := []time.Duration{0, 0}
+	for attempt := 1; attempt <= len(delays)+1; attempt++ {
+		current, err := s.repo.Get(s.ctx, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Stamp the claim one hour behind the database clock.
+		if err := s.repo.UpdateByID(s.ctx, created.ID, current.Version, func(t *domain.Task) (bool, error) { return t.Start(t.NextRetry) }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(s.ctx, `UPDATE tasks SET created_at=LEAST(created_at,now()-interval '1 hour'),updated_at=now()-interval '1 hour' WHERE id=$1`, created.ID); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := s.repo.Get(s.ctx, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, err := s.repo.ReleaseStale(s.ctx, time.Hour+time.Minute, delays); n != 0 || err != nil {
+			t.Fatalf("fresh claim %d released=%d,%v", attempt, n, err)
+		}
+		if n, err := s.repo.ReleaseStale(s.ctx, 59*time.Minute+30*time.Second, delays); n != 1 || err != nil {
+			t.Fatalf("recover %d=%d,%v", attempt, n, err)
+		}
+		state, err := s.repo.Get(s.ctx, created.ID)
+		if err != nil || state.IsRunning || state.RetryCount != min(attempt, len(delays)) || state.Version != current.Version+2 || !state.UpdatedAt.After(claimed.UpdatedAt.Add(59*time.Minute)) {
+			t.Fatalf("recover %d=%+v,%v", attempt, state, err)
+		}
+		if attempt <= len(delays) && (state.Status != domain.Pending || state.IsSubmitted || state.Error != nil || !state.NextRetry.Equal(state.UpdatedAt)) {
+			t.Fatalf("recover %d did not return to pending=%+v", attempt, state)
+		}
+		if attempt > len(delays) && (!state.Finished() || !state.IsSubmitted || state.Result != nil || state.Error == nil || *state.Error != "abandoned after 3 attempts; the last execution was interrupted") {
+			t.Fatalf("recover %d did not abandon=%+v", attempt, state)
+		}
+	}
+	var status int
+	if err := s.db.QueryRowContext(s.ctx, `SELECT status FROM tasks WHERE id=$1`, created.ID).Scan(&status); err != nil || status != 1 {
+		t.Fatalf("stored status=%d,%v", status, err)
+	}
+}
+
+// ReleaseStale skips a stale row locked by a concurrent transaction (e.g. an
+// outcome commit in flight) and releases it on a later call.
+func TestReleaseStaleSkipsLockedRows(t *testing.T) {
+	s := newPostgresStack(t, true)
+	svc := usecase.NewTaskUseCase(s.repo, sweeperOnly, time.Now)
+	created := submitTask(t, s.ctx, svc, "locked")
+	if err := s.repo.UpdateByID(s.ctx, created.ID, created.Version, func(t *domain.Task) (bool, error) { return t.Start(time.Now()) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(s.ctx, `UPDATE tasks SET created_at=now()-interval '1 hour',updated_at=now()-interval '1 hour' WHERE id=$1`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var eventID domain.ID
-	if err = db.QueryRowContext(ctx, `SELECT event_id FROM outbox WHERE task_id=$1 AND destination='work' ORDER BY available_at DESC,event_id DESC LIMIT 1`, id).Scan(&eventID); err != nil {
+	if _, err := tx.ExecContext(s.ctx, `SELECT 1 FROM tasks WHERE id=$1 FOR UPDATE`, created.ID); err != nil {
 		t.Fatal(err)
 	}
-	return usecase.ProcessTaskRequest{ID: string(id), EventID: string(eventID), ExecutionID: string(task.Snapshot().ExecutionID)}
-}
-
-type signalStore struct {
-	inner  usecase.Store
-	failed chan struct{}
-	once   sync.Once
-}
-
-func (s *signalStore) signal() { s.once.Do(func() { s.failed <- struct{}{} }) }
-func (s *signalStore) Get(ctx context.Context, id domain.ID) (*domain.Task, error) {
-	v, err := s.inner.Get(ctx, id)
-	if err != nil {
-		s.signal()
+	if n, err := s.repo.ReleaseStale(s.ctx, staleAfter, retryDelays); n != 0 || err != nil {
+		t.Fatalf("locked row released=%d,%v", n, err)
 	}
-	return v, err
-}
-func (s *signalStore) Within(ctx context.Context, fn func(usecase.Repository) error) error {
-	err := s.inner.Within(ctx, fn)
-	if err != nil {
-		s.signal()
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
 	}
-	return err
+	if n, err := s.repo.ReleaseStale(s.ctx, staleAfter, retryDelays); n != 1 || err != nil {
+		t.Fatalf("unlocked row=%d,%v", n, err)
+	}
 }
 
-type switchStore struct {
-	mu      sync.RWMutex
-	current usecase.Store
-}
-
-func (s *switchStore) Set(v usecase.Store) { s.mu.Lock(); s.current = v; s.mu.Unlock() }
-func (s *switchStore) get() usecase.Store  { s.mu.RLock(); defer s.mu.RUnlock(); return s.current }
-func (s *switchStore) Get(ctx context.Context, id domain.ID) (*domain.Task, error) {
-	return s.get().Get(ctx, id)
-}
-func (s *switchStore) Within(ctx context.Context, fn func(usecase.Repository) error) error {
-	return s.get().Within(ctx, fn)
-}
-
-func (r *runningConsumer) Stop() error {
-	r.stopOnce.Do(r.cancel)
-	select {
-	case <-r.done:
-		if errors.Is(r.err, context.Canceled) {
+// Graceful shutdown commits under a detached context: finished work is kept
+// and the interrupted claim returns to pending without spending any budget.
+func TestShutdownReleasesInterruptedClaimWithoutSpendingBudget(t *testing.T) {
+	s := newPostgresStack(t, true)
+	svc := usecase.NewTaskUseCase(s.repo, sweeperOnly, time.Now)
+	svc.Parallelism = 2
+	first := submitTask(t, s.ctx, svc, "first")
+	second := submitTask(t, s.ctx, svc, "second")
+	var calls atomic.Int32
+	started := make(chan struct{})
+	var execute usecase.Work = func(ctx context.Context) error {
+		if calls.Add(1) == 1 {
 			return nil
 		}
-		return r.err
-	case <-time.After(10 * time.Second):
-		return errors.New("consumer goroutine did not stop")
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
 	}
-}
-
-type barrierProcessor struct {
-	started chan struct{}
-	release chan struct{}
-}
-
-func (p *barrierProcessor) Execute(ctx context.Context, _ domain.ID, _ domain.Payload) (string, error) {
-	p.started <- struct{}{}
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-p.release:
-		return "parallel", nil
+	ctx, cancel := context.WithCancel(s.ctx)
+	done := make(chan error, 1)
+	go func() { done <- svc.ProcessTasks(ctx, []domain.ID{first.ID, second.ID}, execute, retryDelays) }()
+	<-started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown=%v", err)
 	}
-}
-
-func (p blockingProcessor) Execute(context.Context, domain.ID, domain.Payload) (string, error) {
-	close(p.started)
-	<-p.release
-	return "late", nil
+	completed, released := 0, 0
+	for _, id := range []domain.ID{first.ID, second.ID} {
+		state, err := s.repo.Get(s.ctx, id)
+		switch {
+		case err != nil:
+			t.Fatal(err)
+		case state.Status == domain.Completed && state.Result != nil:
+			completed++
+		case state.Status == domain.Pending && !state.IsRunning && !state.IsSubmitted && state.RetryCount == 0 && state.Error == nil && state.Version == 3:
+			released++
+		default:
+			t.Fatalf("shutdown state=%+v", state)
+		}
+	}
+	if completed != 1 || released != 1 {
+		t.Fatalf("completed=%d released=%d", completed, released)
+	}
+	if n, err := s.repo.ReleaseStale(s.ctx, time.Microsecond, retryDelays); n != 0 || err != nil {
+		t.Fatalf("released claims left for recovery=%d,%v", n, err)
+	}
 }
