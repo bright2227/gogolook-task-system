@@ -45,7 +45,7 @@ func TestSeparateResourcesManagersInitializeAndClose(t *testing.T) {
 	shared := configs.NewSharedTaskQueueResources(rabbitmq.Config{URL: s.brokerURL, Queue: workQueue, DialTimeout: time.Second}, 2)
 	t.Cleanup(func() { _ = shared.Close() })
 	svc := usecase.NewTaskUseCase(task.NewTaskRepository(postgres.DB), shared, time.Now)
-	early, err := svc.Submit(s.ctx, "", []byte(`{"source":"before-topology"}`))
+	early, err := svc.Submit(s.ctx, "test task", []byte(`{"source":"before-topology"}`))
 	if err != nil || early.Status != domain.Pending || early.IsSubmitted {
 		t.Fatalf("submission before topology=%+v,%v; want pending, unsubmitted, for the sweeper", early, err)
 	}
@@ -75,7 +75,7 @@ func TestSeparateResourcesManagersInitializeAndClose(t *testing.T) {
 	}
 
 	// Once sweeper/consumer declared the topology, the server publishes.
-	created, err := svc.Submit(s.ctx, "", []byte(`{"source":"resources-manager"}`))
+	created, err := svc.Submit(s.ctx, "test task", []byte(`{"source":"resources-manager"}`))
 	if err != nil {
 		t.Fatalf("task repository through managed DB: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestSeparateResourcesManagersInitializeAndClose(t *testing.T) {
 	failures := make(chan error, concurrent)
 	for range concurrent {
 		wg.Go(func() {
-			if item, err := svc.Submit(s.ctx, "", []byte("concurrent")); err != nil || !item.IsSubmitted {
+			if item, err := svc.Submit(s.ctx, "test task", []byte("concurrent")); err != nil || !item.IsSubmitted {
 				failures <- fmt.Errorf("concurrent submit=%+v,%v", item, err)
 			}
 		})

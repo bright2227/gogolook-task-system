@@ -237,6 +237,8 @@ func TestEditRejectsRunningAndInvalidContentWithoutMutation(t *testing.T) {
 		payload Payload
 		err     error
 	}{
+		{"", payload, ErrName},
+		{" \t\n\u3000", payload, ErrName},
 		{string([]byte{0xff}), payload, ErrName},
 		{"before\x00after", payload, ErrName},
 		{"\x00", payload, ErrName},

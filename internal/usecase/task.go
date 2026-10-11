@@ -91,6 +91,9 @@ func NewTaskUseCase(repository port.TaskRepository, queue TaskQueue, clock func(
 type Work func(context.Context) error
 
 func (s *TaskUseCase) Submit(ctx context.Context, name string, raw []byte) (*domain.Task, error) {
+	if err := domain.ValidateName(name); err != nil {
+		return nil, err
+	}
 	p, err := domain.NewPayload(raw)
 	if err != nil {
 		return nil, err

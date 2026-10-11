@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/bright2227/gogolook-task-system/internal/domain"
 )
 
 type taskResponse struct {
@@ -23,6 +25,7 @@ type taskResponse struct {
 
 func main() {
 	base := flag.String("url", "http://localhost:8080", "task API base URL")
+	name := flag.String("name", "load test", "nonblank task name (at most 256 UTF-8 bytes)")
 	payload := flag.String("payload", "load test", "task payload string")
 	duration := flag.Duration("duration", 30*time.Second, "load generation duration")
 	concurrency := flag.Int("concurrency", 8, "concurrent create-and-poll clients")
@@ -32,9 +35,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "duration, concurrency, and poll must be positive")
 		os.Exit(2)
 	}
+	if err := domain.ValidateName(*name); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	createBody, err := json.Marshal(struct {
+		Name    string `json:"name"`
 		Payload string `json:"payload"`
-	}{Payload: *payload})
+	}{Name: *name, Payload: *payload})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "encode task request:", err)
 		os.Exit(2)

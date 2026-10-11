@@ -170,16 +170,16 @@ func TestTaskHTTPFlowAndValidation(t *testing.T) {
 			t.Errorf("body=%q status=%d", body, got.Code)
 		}
 	}
-	if got := call(http.MethodPost, "/tasks", `{"payload":"`+strings.Repeat("a", domain.MaxPayloadBytes)+`"}`, ""); got.Code != 200 {
+	if got := call(http.MethodPost, "/tasks", `{"name":"test task","payload":"`+strings.Repeat("a", domain.MaxPayloadBytes)+`"}`, ""); got.Code != 200 {
 		t.Errorf("max payload=%d", got.Code)
 	}
-	for _, body := range []string{`{"payload":"` + strings.Repeat("a", domain.MaxPayloadBytes+1) + `"}`, `{"payload":"a\u0000b"}`} {
+	for _, body := range []string{`{"name":"test task","payload":"` + strings.Repeat("a", domain.MaxPayloadBytes+1) + `"}`, `{"name":"test task","payload":"a\u0000b"}`} {
 		if got := call(http.MethodPost, "/tasks", body, ""); got.Code != 422 {
 			t.Errorf("invalid payload of %d bytes=%d", len(body), got.Code)
 		}
 	}
 	// 1024 escaped bytes fit; a body past 8 KiB is refused before validation.
-	if got := call(http.MethodPost, "/tasks", `{"payload":"`+strings.Repeat(`\u00e9`, 512)+`"}`, ""); got.Code != 200 {
+	if got := call(http.MethodPost, "/tasks", `{"name":"test task","payload":"`+strings.Repeat(`\u00e9`, 512)+`"}`, ""); got.Code != 200 {
 		t.Errorf("escaped max payload=%d", got.Code)
 	}
 	// The largest valid body, fully escaped, fits under the cap.
@@ -197,7 +197,7 @@ func TestTaskHTTPFlowAndValidation(t *testing.T) {
 	if got := call(http.MethodPut, "/tasks/"+item.ID, longName, ""); got.Code != 422 {
 		t.Errorf("PUT oversized name=%d", got.Code)
 	}
-	if got := call(http.MethodPost, "/tasks", `{"payload":"`+strings.Repeat("a", 9<<10)+`"}`, ""); got.Code != http.StatusRequestEntityTooLarge {
+	if got := call(http.MethodPost, "/tasks", `{"name":"test task","payload":"`+strings.Repeat("a", 9<<10)+`"}`, ""); got.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversized body=%d", got.Code)
 	}
 	if got := call(http.MethodPut, "/tasks/"+string(domain.NewID()), `{"name":"n","payload":"`+strings.Repeat("a", 9<<10)+`"}`, ""); got.Code != http.StatusRequestEntityTooLarge {
@@ -233,6 +233,54 @@ func TestTaskUpdateRejectsInvalidBodiesAndPreconditions(t *testing.T) {
 			if w.Code != 422 {
 				t.Errorf("invalid If-Match %q %s=%d", version, method, w.Code)
 			}
+		}
+	}
+}
+
+func TestTaskNamesAreRequiredWithoutChangingStorage(t *testing.T) {
+	ctx := context.Background()
+	repo := task.NewMockTaskRepository()
+	svc := usecase.NewTaskUseCase(repo, acceptedQueue{}, time.Now)
+	original, err := svc.Submit(ctx, "original", []byte("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := NewTaskController(svc, func(context.Context) error { return nil }).Handler()
+	for _, body := range []string{
+		`{"payload":"changed"}`,
+		`{"name":null,"payload":"changed"}`,
+		`{"name":"","payload":"changed"}`,
+		`{"name":" \t\r\n","payload":"changed"}`,
+		`{"name":"\u00a0\u3000","payload":"changed"}`,
+		`{"name":1,"payload":"changed"}`,
+	} {
+		for _, method := range []string{http.MethodPost, http.MethodPut} {
+			path := "/tasks"
+			if method == http.MethodPut {
+				path += "/" + string(original.ID)
+			}
+			w := httptest.NewRecorder()
+			api.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(body)))
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Errorf("%s body %s=%d %s", method, body, w.Code, w.Body)
+			}
+			assertProblemMessage(t, w)
+		}
+	}
+	items, _, err := svc.List(ctx, 100, time.Time{}, "")
+	if err != nil || len(items) != 1 || items[0].Name != original.Name || items[0].Payload != original.Payload || items[0].Version != original.Version {
+		t.Fatalf("rejected names changed storage=%+v err=%v", items, err)
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPut} {
+		path := "/tasks"
+		if method == http.MethodPut {
+			path += "/" + string(original.ID)
+		}
+		w := httptest.NewRecorder()
+		api.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(`{"name":" 你好🙂 ","payload":""}`)))
+		var item response
+		if err := json.Unmarshal(w.Body.Bytes(), &item); err != nil || w.Code != http.StatusOK || item.Name != " 你好🙂 " || item.Payload != "" {
+			t.Fatalf("%s valid name=%d %s err=%v", method, w.Code, w.Body, err)
 		}
 	}
 }
@@ -284,7 +332,7 @@ func TestHTTPRejectsInvalidBodies(t *testing.T) {
 		body string
 		want int
 	}{
-		{`{"payload":"x" ,"surprise":1}`, http.StatusOK}, {`{"payload":"x"} {}`, http.StatusUnprocessableEntity}, {`{"payload":{}}`, http.StatusUnprocessableEntity}, {`{"payload":null}`, http.StatusUnprocessableEntity}, {`{}`, http.StatusUnprocessableEntity},
+		{`{"name":"test task","payload":"x" ,"surprise":1}`, http.StatusOK}, {`{"payload":"x"} {}`, http.StatusUnprocessableEntity}, {`{"payload":{}}`, http.StatusUnprocessableEntity}, {`{"payload":null}`, http.StatusUnprocessableEntity}, {`{}`, http.StatusUnprocessableEntity},
 		{`{"payload":"x","name":null}`, http.StatusUnprocessableEntity},
 		{`{"payload":"x","name":3}`, http.StatusUnprocessableEntity},
 		{`{"payload":"x","name":"before\u0000after"}`, http.StatusUnprocessableEntity},
@@ -322,7 +370,7 @@ func TestTaskListMapsPaginationAndMasksStorageErrors(t *testing.T) {
 func TestHTTPReturnsSourceTaskError(t *testing.T) {
 	repo := task.NewMockTaskRepository()
 	taskUseCase := usecase.NewTaskUseCase(repo, acceptedQueue{}, time.Now)
-	created, err := taskUseCase.Submit(context.Background(), "", []byte(`{}`))
+	created, err := taskUseCase.Submit(context.Background(), "test task", []byte(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +408,7 @@ func TestTaskListCursorKeepsTimestampTiesStable(t *testing.T) {
 	now := time.Date(2026, 5, 12, 9, 30, 0, 123, time.UTC)
 	taskUseCase := usecase.NewTaskUseCase(repo, acceptedQueue{}, func() time.Time { return now })
 	for i := 0; i < 3; i++ {
-		if _, err := taskUseCase.Submit(context.Background(), "", []byte(`{"n":1}`)); err != nil {
+		if _, err := taskUseCase.Submit(context.Background(), "test task", []byte(`{"n":1}`)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -484,7 +532,7 @@ func TestTaskStatusInRequestBodyIsValidatedAndIgnored(t *testing.T) {
 		}
 	}
 	for _, status := range []string{"2", "-1", `"1"`, "1.5", "null", `"x"`} {
-		if w, _ := call(http.MethodPost, "/tasks", `{"payload":"p","status":`+status+`}`); w.Code != 422 {
+		if w, _ := call(http.MethodPost, "/tasks", `{"name":"test task","payload":"p","status":`+status+`}`); w.Code != 422 {
 			t.Errorf("POST status %s=%d %s", status, w.Code, w.Body)
 		} else {
 			assertProblemMessage(t, w)

@@ -15,7 +15,7 @@ recovery; the [README](../README.md) covers setup and configuration.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `id` | string | UUID generated at creation, stored in lower case. |
-| `name` | string | Task name; defaults to an empty string. |
+| `name` | string | Task name; required and nonblank for creation and edits. |
 | `payload` | string | Processing input, including empty or non-JSON text. |
 | `status` | integer | 0 incomplete; 1 completed, including terminal failures. |
 | `is_running` | boolean | A consumer holds an execution claim. |
@@ -33,7 +33,7 @@ execution time are stored internally and are not exposed in the response.
 
 | Method and path | Request | Success |
 | --- | --- | --- |
-| `POST /tasks` | Required string `payload`; optional string `name` and integer `status`. | 200 with the task, `Location` and `ETag`. |
+| `POST /tasks` | Required strings `name` and `payload`; optional integer `status`. | 200 with the task, `Location` and `ETag`. |
 | `GET /tasks/{id}` | Task UUID. | 200 with the task and `ETag`. |
 | `PUT /tasks/{id}` | Required strings `name` and `payload`; optional integer `status` and `If-Match` header. | 200 with the task and `ETag`. |
 | `DELETE /tasks/{id}` | Task UUID; optional `If-Match` header. | 204 with no body. |
@@ -56,10 +56,15 @@ persisted task; the sweeper recovers it. A storage failure returns 500.
 ### Validation and errors
 
 POST and PUT require one JSON object and a raw body of at most 8 KiB. Invalid
-UTF-8 bytes are rejected before JSON decoding. A name is valid UTF-8 without
-NUL and at most 256 bytes; a payload follows the same rules with a 1024-byte
-limit. These limits count bytes, while execution counts Unicode code points.
-Empty names and payloads are valid.
+UTF-8 bytes are rejected before JSON decoding. POST and PUT require a name
+containing at least one non-whitespace character, valid UTF-8 without NUL,
+and at most 256 bytes. Missing, null, empty and whitespace-only names return
+422. Valid names are stored as supplied, including surrounding whitespace.
+A payload is valid UTF-8 without NUL and at most 1024 bytes; empty payloads
+remain valid. These limits count bytes, while execution counts Unicode code points.
+
+Previously stored unnamed tasks remain readable and processable. Their next
+content edit must supply a valid nonblank name.
 
 POST ignores unknown fields; PUT rejects them. A supplied `status` must be the integer 0 or 1;
 strings, null and other values are invalid.

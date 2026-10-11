@@ -179,7 +179,7 @@ func TestConsumeCommitsOutcomesBeforeAcknowledgment(t *testing.T) {
 		ctx := context.Background()
 		repo := task.NewMockTaskRepository()
 		svc := usecase.NewTaskUseCase(repo, acceptedQueue{}, time.Now)
-		created, err := svc.Submit(ctx, "", []byte("你好🙂"))
+		created, err := svc.Submit(ctx, "test task", []byte("你好🙂"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -207,7 +207,7 @@ func TestConsumeProcessingFailureSkipsAcknowledgment(t *testing.T) {
 	ctx := context.Background()
 	repo := task.NewMockTaskRepository()
 	svc := usecase.NewTaskUseCase(repo, acceptedQueue{}, time.Now)
-	created, err := svc.Submit(ctx, "", []byte("text"))
+	created, err := svc.Submit(ctx, "test task", []byte("text"))
 	if err != nil {
 		t.Fatal(err)
 	}

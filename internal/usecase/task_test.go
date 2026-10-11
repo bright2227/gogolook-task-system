@@ -19,6 +19,53 @@ import (
 // retryDelays mirrors the source's default network retry policy.
 var retryDelays = []time.Duration{time.Second, 10 * time.Second, time.Minute}
 
+func TestSubmitRejectsInvalidNamesBeforeStorageOrPublication(t *testing.T) {
+	repo := task.NewMockTaskRepository()
+	publications := 0
+	queue := enqueueFunc(func(_ context.Context, id domain.ID) (Publication, error) {
+		publications++
+		return Publication{ID: id}, nil
+	})
+	svc := NewTaskUseCase(repo, queue, time.Now)
+	for _, name := range []string{"", " \t\n", "\u00a0\u3000", "before\x00after", string([]byte{0xff}), strings.Repeat("a", domain.MaxNameBytes+1)} {
+		created, err := svc.Submit(context.Background(), name, []byte("payload"))
+		if created != nil || !errors.Is(err, domain.ErrName) {
+			t.Errorf("name %q: task=%+v err=%v", name, created, err)
+		}
+	}
+	items, _, err := svc.List(context.Background(), 100, time.Time{}, "")
+	if err != nil || len(items) != 0 || publications != 0 {
+		t.Fatalf("invalid names stored=%d published=%d err=%v", len(items), publications, err)
+	}
+}
+
+func TestLegacyUnnamedTaskCanProcessAndBeRenamed(t *testing.T) {
+	repo := task.NewMockTaskRepository()
+	payload, _ := domain.NewPayload([]byte("hello"))
+	legacy, err := domain.Submit(payload, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Insert(context.Background(), legacy); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewTaskUseCase(repo, accepted, time.Now)
+	if err := svc.ProcessTasks(context.Background(), []domain.ID{legacy.ID}, Delay(0), nil); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := svc.Get(context.Background(), string(legacy.ID))
+	if err != nil || stored.Name != "" || !stored.Finished() || stored.Result == nil || *stored.Result != "5" {
+		t.Fatalf("legacy task=%+v err=%v", stored, err)
+	}
+	if _, err := svc.Update(context.Background(), string(legacy.ID), "", []byte("hello"), 0); !errors.Is(err, domain.ErrName) {
+		t.Fatalf("unnamed edit=%v", err)
+	}
+	updated, err := svc.Update(context.Background(), string(legacy.ID), "renamed", []byte("hello"), 0)
+	if err != nil || updated.Name != "renamed" || !updated.Finished() {
+		t.Fatalf("renamed legacy task=%+v err=%v", updated, err)
+	}
+}
+
 func TestExecuteCountsUnicodePayloadCharacters(t *testing.T) {
 	svc := NewTaskUseCase(task.NewMockTaskRepository(), accepted, time.Now)
 	for _, tc := range []struct{ payload, want string }{
@@ -40,7 +87,7 @@ func TestSubmitProcessAndTerminalPrivateError(t *testing.T) {
 	clock := func() time.Time { return now }
 	repo := task.NewMockTaskRepository()
 	svc := NewTaskUseCase(repo, accepted, clock)
-	created, err := svc.Submit(context.Background(), "", []byte(`{"x":1}`))
+	created, err := svc.Submit(context.Background(), "test task", []byte(`{"x":1}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +114,7 @@ func TestListKeysetPagesAndPaginationValidation(t *testing.T) {
 	now := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
 	svc := NewTaskUseCase(task.NewMockTaskRepository(), accepted, func() time.Time { return now })
 	for range 3 {
-		if _, err := svc.Submit(context.Background(), "", []byte(`{}`)); err != nil {
+		if _, err := svc.Submit(context.Background(), "test task", []byte(`{}`)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -109,7 +156,7 @@ func TestOnlyNetworkFailuresRetryWithinBudget(t *testing.T) {
 			repo := task.NewMockTaskRepository()
 			svc := NewTaskUseCase(repo, accepted, func() time.Time { return now })
 			retryDelays := []time.Duration{time.Second, time.Minute}
-			created, err := svc.Submit(context.Background(), "", []byte("text"))
+			created, err := svc.Submit(context.Background(), "test task", []byte("text"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -207,7 +254,7 @@ func TestExecutionTimeoutRetriesThenPersistsError(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err() // Work contract: a done context is never reported as success.
 	}
-	created, _ := svc.Submit(context.Background(), "", []byte("text"))
+	created, _ := svc.Submit(context.Background(), "test task", []byte("text"))
 	// The per-task deadline is transient: it spends the retry budget first.
 	oneRetry := []time.Duration{0}
 	if err := svc.ProcessTasks(context.Background(), []domain.ID{created.ID}, execution, oneRetry); err != nil {
@@ -232,8 +279,8 @@ func TestWorkPanicCompletesOnlyThatTask(t *testing.T) {
 	ctx := context.Background()
 	repo := task.NewMockTaskRepository()
 	svc := NewTaskUseCase(repo, accepted, time.Now)
-	poison, _ := svc.Submit(ctx, "", []byte("poison"))
-	healthy, _ := svc.Submit(ctx, "", []byte("text"))
+	poison, _ := svc.Submit(ctx, "test task", []byte("poison"))
+	healthy, _ := svc.Submit(ctx, "test task", []byte("text"))
 	// Work only sees ctx, so the first call (Parallelism 1) panics.
 	var calls atomic.Int64
 	svc.Parallelism = 1
@@ -286,8 +333,8 @@ func TestShutdownReleasesInterruptedClaimsAndKeepsFinishedWork(t *testing.T) {
 			}
 			svc := NewTaskUseCase(repo, accepted, time.Now)
 			svc.Parallelism = 2
-			finished, _ := svc.Submit(context.Background(), "", []byte("done"))
-			interrupted, _ := svc.Submit(context.Background(), "", []byte("text"))
+			finished, _ := svc.Submit(context.Background(), "test task", []byte("done"))
+			interrupted, _ := svc.Submit(context.Background(), "test task", []byte("text"))
 			ctx, cancel := context.WithCancel(context.Background())
 			// The first execution finishes; the second runs until shutdown.
 			var calls atomic.Int64
@@ -388,7 +435,7 @@ func TestSubmissionPersistsBeforePublishThenMarksSubmit(t *testing.T) {
 	svc := NewTaskUseCase(repo, queue, func() time.Time { return now })
 	svc.RepublishAfter = republishAfter
 	svc.StaleAfter = staleAfter
-	created, err := svc.Submit(context.Background(), "", []byte(""))
+	created, err := svc.Submit(context.Background(), "test task", []byte(""))
 	if err != nil || !created.IsSubmitted || created.Version != 1 {
 		t.Fatalf("submission=%+v,%v", created, err)
 	}
@@ -467,7 +514,7 @@ func TestSweeperLeavesNewTasksToFastPathDuringGrace(t *testing.T) {
 	}), func() time.Time { return now })
 	svc.RepublishAfter = republishAfter
 	svc.StaleAfter = staleAfter
-	created, err := svc.Submit(ctx, "", []byte("text"))
+	created, err := svc.Submit(ctx, "test task", []byte("text"))
 	if err != nil || created.IsSubmitted {
 		t.Fatalf("submission=%+v,%v", created, err)
 	}
@@ -489,7 +536,7 @@ func TestSweeperPublishesDueRetryImmediately(t *testing.T) {
 	svc := NewTaskUseCase(repo, accepted, func() time.Time { return now })
 	svc.RepublishAfter = republishAfter
 	svc.StaleAfter = staleAfter
-	created, err := svc.Submit(ctx, "", []byte("text"))
+	created, err := svc.Submit(ctx, "test task", []byte("text"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +561,7 @@ func TestSweeperRepublishesExpiredSubmissionAfterRepublishAfter(t *testing.T) {
 	}), func() time.Time { return now })
 	svc.RepublishAfter = republishAfter
 	svc.StaleAfter = staleAfter
-	created, err := svc.Submit(ctx, "", []byte("text"))
+	created, err := svc.Submit(ctx, "test task", []byte("text"))
 	if err != nil || !created.IsSubmitted {
 		t.Fatalf("submission=%+v,%v", created, err)
 	}
@@ -547,7 +594,7 @@ func TestSweeperWithoutRepublishAfterLeavesSubmittedTasks(t *testing.T) {
 		return Publication{ID: id}, nil
 	}), func() time.Time { return now })
 	svc.StaleAfter = staleAfter
-	created, err := svc.Submit(ctx, "", []byte("text"))
+	created, err := svc.Submit(ctx, "test task", []byte("text"))
 	if err != nil || !created.IsSubmitted {
 		t.Fatalf("submission=%+v,%v", created, err)
 	}
@@ -570,7 +617,7 @@ func TestNotDueDeliveryHandsSubmittedTaskBackToSweeper(t *testing.T) {
 		return Publication{ID: id}, nil
 	}), func() time.Time { return now })
 	svc.StaleAfter = staleAfter
-	created, err := svc.Submit(ctx, "", []byte("text"))
+	created, err := svc.Submit(ctx, "test task", []byte("text"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -654,7 +701,7 @@ func TestSweeperSkipsSubmittedTasksPastPending(t *testing.T) {
 	svc.StaleAfter = 2 * time.Hour // The running claim stays live here.
 	var ids []domain.ID
 	for range 2 {
-		created, err := svc.Submit(ctx, "", []byte("text"))
+		created, err := svc.Submit(ctx, "test task", []byte("text"))
 		if err != nil || !created.IsSubmitted {
 			t.Fatalf("submission=%+v,%v", created, err)
 		}
@@ -1293,7 +1340,7 @@ func TestProcessTasksLimitsConcurrencyAndJoins(t *testing.T) {
 	svc.Parallelism = 2
 	var ids []domain.ID
 	for range 4 {
-		created, err := svc.Submit(ctx, "", []byte("text"))
+		created, err := svc.Submit(ctx, "test task", []byte("text"))
 		if err != nil {
 			t.Fatal(err)
 		}

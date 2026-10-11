@@ -47,6 +47,10 @@ curl -i -X DELETE -H 'If-Match: "4"' http://localhost:8080/tasks/TASK_ID
 curl 'http://localhost:8080/tasks?page_size=20'
 ```
 
+POST and PUT require a nonblank `name` (at most 256 UTF-8 bytes) and a string
+`payload`; empty payloads are valid. Missing, null, empty or whitespace-only
+names return 422. The load CLI supplies a name by default; use `-name` to set it.
+
 PUT and DELETE return 409 while a task is running or the supplied version is
 stale. `If-Match` is optional; omitting it operates on the current row under a
 lock. A changed payload starts a new execution. `status` is managed by processing;

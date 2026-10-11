@@ -99,6 +99,15 @@ func validName(name string) bool {
 	return len(name) <= MaxNameBytes && utf8.ValidString(name) && !strings.ContainsRune(name, '\x00')
 }
 
+// ValidateName requires nonblank names for new submissions and edits. Restore
+// still accepts unnamed tasks persisted before names became required.
+func ValidateName(name string) error {
+	if !validName(name) || strings.TrimSpace(name) == "" {
+		return ErrName
+	}
+	return nil
+}
+
 // Restore validates and detaches a persisted task, including nullable values.
 func Restore(s Task) (*Task, error) {
 	if _, err := ParseID(string(s.ID)); err != nil {
@@ -151,8 +160,8 @@ func (t *Task) Edit(name string, payload Payload, now time.Time) (bool, error) {
 	if t.IsRunning {
 		return false, ErrBusy
 	}
-	if !validName(name) {
-		return false, ErrName
+	if err := ValidateName(name); err != nil {
+		return false, err
 	}
 	if !payload.valid {
 		return false, ErrPayload

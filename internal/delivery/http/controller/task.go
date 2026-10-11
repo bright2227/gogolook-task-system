@@ -218,12 +218,12 @@ func (a *TaskController) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	var in struct {
 		Payload *string         `json:"payload"`
-		Name    json.RawMessage `json:"name"`
+		Name    *string         `json:"name"`
 		Status  json.RawMessage `json:"status"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&in); err != nil {
-		write(w, 422, map[string]string{"message": "expected a JSON object with a string payload"})
+		write(w, 422, map[string]string{"message": "expected a JSON object with name and payload strings"})
 		return
 	}
 	var extra any
@@ -239,16 +239,11 @@ func (a *TaskController) submit(w http.ResponseWriter, r *http.Request) {
 		a.problem(w, domain.ErrPayload)
 		return
 	}
-	name := ""
-	if len(in.Name) > 0 {
-		var value *string
-		if err := json.Unmarshal(in.Name, &value); err != nil || value == nil {
-			a.problem(w, domain.ErrName)
-			return
-		}
-		name = *value
+	if in.Name == nil {
+		a.problem(w, domain.ErrName)
+		return
 	}
-	s, err := a.useCase.Submit(r.Context(), name, []byte(*in.Payload))
+	s, err := a.useCase.Submit(r.Context(), *in.Name, []byte(*in.Payload))
 	if err != nil {
 		a.problem(w, err)
 		return

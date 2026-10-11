@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -79,6 +80,23 @@ func TestOpenAPISpecIsServedAndDocumentsTaskRoutes(t *testing.T) {
 	}
 	if status.Type != "integer" || len(status.Enum) != 2 || status.Enum[0] != 0 || status.Enum[1] != 1 {
 		t.Errorf("Task status schema=%+v, want integer enum [0,1]", status)
+	}
+	for _, schema := range []string{"SubmitTask", "UpdateTask"} {
+		request := spec.Components.Schemas[schema]
+		for _, field := range []string{"name", "payload"} {
+			if !slices.Contains(request.Required, field) {
+				t.Errorf("%s does not require %s", schema, field)
+			}
+		}
+		var name struct {
+			Type      string  `json:"type"`
+			MinLength int     `json:"minLength"`
+			Pattern   string  `json:"pattern"`
+			Default   *string `json:"default"`
+		}
+		if err := json.Unmarshal(request.Properties["name"], &name); err != nil || name.Type != "string" || name.MinLength != 1 || name.Pattern == "" || name.Default != nil {
+			t.Errorf("%s name schema=%+v err=%v", schema, name, err)
+		}
 	}
 }
 

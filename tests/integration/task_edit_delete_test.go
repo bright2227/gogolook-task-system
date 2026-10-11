@@ -115,12 +115,19 @@ func TestTaskNamesRejectNULBeforePersistence(t *testing.T) {
 		{http.MethodPost, "/tasks"},
 		{http.MethodPut, "/tasks/" + string(created.ID)},
 	} {
-		body := `{"name":"before\u0000after","payload":"changed"}`
-		req := httptest.NewRequest(request.method, request.path, strings.NewReader(body)).WithContext(s.ctx)
-		response := httptest.NewRecorder()
-		api.ServeHTTP(response, req)
-		if response.Code != http.StatusUnprocessableEntity {
-			t.Fatalf("%s NUL name response=%d %s", request.method, response.Code, response.Body)
+		for _, body := range []string{
+			`{"payload":"changed"}`,
+			`{"name":null,"payload":"changed"}`,
+			`{"name":"","payload":"changed"}`,
+			`{"name":" \t\u3000","payload":"changed"}`,
+			`{"name":"before\u0000after","payload":"changed"}`,
+		} {
+			req := httptest.NewRequest(request.method, request.path, strings.NewReader(body)).WithContext(s.ctx)
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, req)
+			if response.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("%s invalid name %s response=%d %s", request.method, body, response.Code, response.Body)
+			}
 		}
 	}
 	stored, err := s.repo.Get(s.ctx, created.ID)

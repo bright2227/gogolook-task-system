@@ -331,7 +331,7 @@ func (s integrationStack) cleanupQueue(t *testing.T, queue string) {
 }
 func submitTask(t *testing.T, ctx context.Context, svc *usecase.TaskUseCase, raw string) *domain.Task {
 	t.Helper()
-	v, err := svc.Submit(ctx, "", []byte(raw))
+	v, err := svc.Submit(ctx, "test task", []byte(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
