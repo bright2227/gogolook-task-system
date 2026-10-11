@@ -88,17 +88,20 @@ Lost messages still require optional republishing; see [recovery](docs/architect
 ## Tests
 
 ```sh
-make race
+make test-unit
 make vet
 make build
 
 make test-resources-up
-make integration TEST=TestHTTPAndBatchProcessing
-make integration TEST=TestBrokerSessionsRestoreMissingTopology
+make test-integration TEST=TestHTTPAndBatchProcessing
+make test-integration TEST=TestBrokerSessionsRestoreMissingTopology
 make test-resources-down
 ```
 
-`make integration` runs one named test with a 60-second cap against warm
+`make test-unit` runs all unit tests with the race detector. Integration tests,
+including the architecture dependency check, require the `integration` build tag.
+
+`make test-integration` runs one named test with a 60-second cap against warm
 PostgreSQL and RabbitMQ fixtures. Each case gets a fresh database and unique
 queues. List available cases with:
 
@@ -106,9 +109,26 @@ queues. List available cases with:
 go test -tags=integration -list '^Test' ./tests/integration
 ```
 
-Without `INTEGRATION_POSTGRES_URL` and `INTEGRATION_RABBITMQ_URL`, integration
-tests start disposable containers through Testcontainers. CI runs unit tests
-with the race detector, vet, build, and every integration case individually.
+CI starts these fixtures once and runs every integration case individually.
+Each `go test` process reuses the fixtures through the integration URLs supplied
+by `make test-integration`, avoiding repeated container startup.
+
+To let Testcontainers start and clean up disposable containers automatically,
+run Go tests directly without `INTEGRATION_POSTGRES_URL` and
+`INTEGRATION_RABBITMQ_URL`. For example:
+
+```sh
+go test -tags=integration -race -run '^TestHTTPAndBatchProcessing$' -count=1 -timeout 180s -v ./tests/integration
+```
+
+Allow extra time for cold container startup. The architecture dependency check
+does not need Docker or either service:
+
+```sh
+go test -tags=integration -race -run '^TestDependencyRule$' ./tests/integration
+```
+
+CI also runs unit tests with the race detector, vet and build.
 
 ## Development data
 

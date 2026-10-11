@@ -1,4 +1,4 @@
-.PHONY: deps test test-core race vet build integration test-resources-up test-resources-down up down load
+.PHONY: deps test test-unit race vet build test-integration test-resources-up test-resources-down up down load
 
 export GOTOOLCHAIN=local
 
@@ -8,8 +8,8 @@ deps:
 test:
 	go test ./...
 
-test-core:
-	go test -race ./internal/domain ./internal/migrations ./internal/usecase ./internal/repository/task ./internal/delivery ./internal/delivery/http/... ./internal/delivery/amqp ./internal/infrastructure/rabbitmq ./tests/architecture
+test-unit:
+	go test -race ./...
 
 race:
 	go test -race ./...
@@ -36,7 +36,7 @@ test-resources-up:
 test-resources-down:
 	docker compose -p gogolook-tests -f deployments/docker-compose.test.yml down --timeout 5
 
-integration:
+test-integration:
 	@printf '%s\n' '$(TEST)' | grep -Eq '^Test[A-Za-z0-9_]+$$' || (echo 'Set TEST to one exact integration test name'; exit 2)
 	@go test -tags=integration -list '^$(TEST)$$' ./tests/integration | grep -Fxq '$(TEST)' || (echo 'Integration test does not exist: $(TEST)'; exit 2)
 	INTEGRATION_POSTGRES_URL='postgres://task:task@localhost:15432/tasks?sslmode=disable' INTEGRATION_RABBITMQ_URL='amqp://task:task@localhost:15672/' go test -tags=integration -race -run '^$(TEST)$$' -count=1 -timeout 60s -v ./tests/integration

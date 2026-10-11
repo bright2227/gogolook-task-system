@@ -208,7 +208,8 @@ happen once. Work with external side effects must be idempotent.
 
 Use cases call storage and publication ports; adapters implement those ports.
 SQL transactions stay in the repository. AMQP frames and acknowledgements stay
-in broker adapters. Tests in `tests/architecture` enforce these boundaries.
+in broker adapters. `TestDependencyRule` in `tests/integration` enforces these
+boundaries alongside the integration suite; it does not start containers.
 
 ### Schema, pagination and migrations
 

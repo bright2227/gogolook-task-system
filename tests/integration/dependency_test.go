@@ -1,4 +1,6 @@
-package architecture_test
+//go:build integration
+
+package integration
 
 import (
 	"go/ast"
